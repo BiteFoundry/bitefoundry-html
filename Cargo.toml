@@ -1,0 +1,25 @@
+[package]
+name = "bitefoundry-html"
+version = "0.1.0"
+edition = "2021"
+description = "Shared native interactive HTML renderer, on-demand sandboxed QuickJS runtime, content sniffer, and lazy localhost Axum server for BiteFoundry terminal apps"
+license = "MIT"
+repository = "https://github.com/BiteFoundry/bitefoundry-html"
+
+[features]
+default = ["js", "serve"]
+js = ["dep:rquickjs"]
+serve = ["dep:axum", "dep:tokio", "dep:rand"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", optional = true }
+rand = { version = "0.8", optional = true }
+ratatui = "0.28"
+rquickjs = { version = "0.14", features = ["classes", "array-buffer"], optional = true }
+scraper = "0.20"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"], optional = true }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros", "io-util"] }
