@@ -1,11 +1,32 @@
 //! High-level drop-in `HtmlViewSession` state for BiteFoundry terminal apps.
 
+#[cfg(feature = "graphics")]
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "graphics")]
+use crate::canvas::CanvasSurface;
 use crate::dom::{DomDocument, DomNodeId};
+#[cfg(feature = "graphics")]
+use crate::graphics::RasterizedImage;
 #[cfg(feature = "js")]
 use crate::js::JsSession;
-use crate::render::{render_dom, render_raw_html, ControlKind, HtmlTheme, RenderedHtml};
+use crate::markdown::{
+    markdown_to_html_document, render_markdown_document_with_focus, render_raw_markdown,
+};
+#[cfg(feature = "graphics")]
+use crate::render::render_dom_with_graphics;
+#[cfg(not(feature = "graphics"))]
+use crate::render::render_dom;
+use crate::render::{render_raw_html, ControlKind, HtmlTheme, RenderedHtml};
+use crate::sniff::ContentKind;
+
+/// Source document format handled by [`HtmlViewSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Html,
+    Markdown,
+}
 
 /// Shared mutable DOM + side-effect buffers observed by both the TUI session and QuickJS bridge.
 #[derive(Debug)]
@@ -15,6 +36,8 @@ pub struct DomSharedState {
     pub open_urls: Vec<String>,
     pub console_logs: Vec<String>,
     pub dirty: bool,
+    #[cfg(feature = "graphics")]
+    pub canvases: HashMap<DomNodeId, CanvasSurface>,
 }
 
 impl DomSharedState {
@@ -25,6 +48,8 @@ impl DomSharedState {
             open_urls: Vec::new(),
             console_logs: Vec::new(),
             dirty: false,
+            #[cfg(feature = "graphics")]
+            canvases: HashMap::new(),
         }
     }
 }
@@ -59,6 +84,7 @@ struct RenderCacheKey {
 /// inline `<script>` tags or `on*` event attributes exist, and frees it immediately on `Drop`.
 pub struct HtmlViewSession {
     title: Option<String>,
+    source_kind: SourceKind,
     raw_html: String,
     shared: Arc<Mutex<DomSharedState>>,
     #[cfg(feature = "js")]
@@ -72,6 +98,8 @@ pub struct HtmlViewSession {
     dom_version: u64,
     cached_render: Option<RenderedHtml>,
     cache_key: Option<RenderCacheKey>,
+    #[cfg(feature = "graphics")]
+    graphic_png_cache: HashMap<(u64, DomNodeId), RasterizedImage>,
     pending_init_effects: Vec<HtmlEffect>,
 }
 
@@ -98,6 +126,7 @@ impl HtmlViewSession {
 
         let mut session = Self {
             title: resolved_title,
+            source_kind: SourceKind::Html,
             raw_html,
             shared,
             #[cfg(feature = "js")]
@@ -111,6 +140,8 @@ impl HtmlViewSession {
             dom_version: 0,
             cached_render: None,
             cache_key: None,
+            #[cfg(feature = "graphics")]
+            graphic_png_cache: HashMap::new(),
             pending_init_effects: Vec::new(),
         };
 
@@ -130,6 +161,53 @@ impl HtmlViewSession {
         }
 
         session
+    }
+
+    /// Creates a native Markdown viewing session (`0 MB` JS runtime, `js_active = false`).
+    pub fn new_markdown(title: Option<String>, raw_md: String) -> Self {
+        let shared = Arc::new(Mutex::new(DomSharedState::new(DomDocument::parse(""))));
+        Self {
+            title,
+            source_kind: SourceKind::Markdown,
+            raw_html: raw_md,
+            shared,
+            #[cfg(feature = "js")]
+            js: None,
+            raw_mode: false,
+            scroll_y: 0,
+            focused_control: None,
+            editing_input: None,
+            last_status: None,
+            js_active: false,
+            dom_version: 0,
+            cached_render: None,
+            cache_key: None,
+            #[cfg(feature = "graphics")]
+            graphic_png_cache: HashMap::new(),
+            pending_init_effects: Vec::new(),
+        }
+    }
+
+    /// Creates an HTML or Markdown session based on a classified [`ContentKind`].
+    pub fn from_content(title: Option<String>, kind: ContentKind, raw: String) -> Self {
+        match kind {
+            ContentKind::Markdown => Self::new_markdown(title, raw),
+            _ => Self::new(title, raw),
+        }
+    }
+
+    pub fn source_kind(&self) -> SourceKind {
+        self.source_kind
+    }
+
+    /// Returns standalone HTML ready to serve in an external browser via `NativeHtmlServer`.
+    pub fn serve_html(&self) -> String {
+        match self.source_kind {
+            SourceKind::Html => self.raw_html.clone(),
+            SourceKind::Markdown => {
+                markdown_to_html_document(self.title.as_deref(), &self.raw_html)
+            }
+        }
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -184,22 +262,58 @@ impl HtmlViewSession {
 
         let needs_rebuild = self.cached_render.is_none() || self.cache_key.as_ref() != Some(&key);
         if needs_rebuild {
-            let rendered = if self.raw_mode {
-                RenderedHtml {
+            let rendered = match (self.source_kind, self.raw_mode) {
+                (SourceKind::Markdown, true) => {
+                    let mut r = render_raw_markdown(&self.raw_html, width as usize, theme);
+                    if r.title.is_none() {
+                        r.title = self.title.clone();
+                    }
+                    r
+                }
+                (SourceKind::Markdown, false) => render_markdown_document_with_focus(
+                    &self.raw_html,
+                    width as usize,
+                    theme,
+                    self.focused_control,
+                    show_link_urls,
+                ),
+                (SourceKind::Html, true) => RenderedHtml {
                     title: self.title.clone(),
                     lines: render_raw_html(&self.raw_html, width, theme),
                     controls: Vec::new(),
+                    graphics: Vec::new(),
+                    external_scripts: Vec::new(),
+                },
+                (SourceKind::Html, false) => {
+                    let doc_guard = self.shared.lock().expect("DOM state lock poisoned");
+                    #[cfg(feature = "graphics")]
+                    {
+                        self.graphic_png_cache
+                            .retain(|&(ver, _), _| ver == self.dom_version);
+                        render_dom_with_graphics(
+                            &doc_guard.doc,
+                            width,
+                            theme,
+                            self.focused_control,
+                            self.editing_input,
+                            show_link_urls,
+                            Some(&doc_guard.canvases),
+                            Some(&mut self.graphic_png_cache),
+                            self.dom_version,
+                        )
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        render_dom(
+                            &doc_guard.doc,
+                            width,
+                            theme,
+                            self.focused_control,
+                            self.editing_input,
+                            show_link_urls,
+                        )
+                    }
                 }
-            } else {
-                let doc_guard = self.shared.lock().expect("DOM state lock poisoned");
-                render_dom(
-                    &doc_guard.doc,
-                    width,
-                    theme,
-                    self.focused_control,
-                    self.editing_input,
-                    show_link_urls,
-                )
             };
 
             if let Some(idx) = self.focused_control {

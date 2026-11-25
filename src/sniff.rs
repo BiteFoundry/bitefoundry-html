@@ -227,7 +227,7 @@ fn classify_extension(file_name: &str) -> Option<ContentKind> {
     match ext.as_str() {
         "html" | "htm" | "xhtml" => Some(ContentKind::Html),
         "svg" | "svgz" => Some(ContentKind::Svg),
-        "md" | "markdown" => Some(ContentKind::Markdown),
+        "md" | "markdown" | "mdx" => Some(ContentKind::Markdown),
         "pdf" => Some(ContentKind::Pdf),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(ContentKind::RasterImage),
         "txt" | "log" | "csv" => Some(ContentKind::PlainText),
@@ -263,6 +263,15 @@ pub fn sniff_content_kind(
                 return ContentKind::Svg;
             }
             if looks_like_html_bytes(b) {
+                let explicit_markdown =
+                    mime_hint.and_then(classify_mime) == Some(ContentKind::Markdown)
+                        || file_name.and_then(classify_extension) == Some(ContentKind::Markdown);
+                let slice = strip_bom_and_ws(b);
+                let is_full_html_doc = starts_with_tag_ci(slice, b"<!doctype html")
+                    || starts_with_tag_ci(slice, b"<html");
+                if explicit_markdown && !is_full_html_doc && looks_like_plain_text(b) {
+                    return ContentKind::Markdown;
+                }
                 return ContentKind::Html;
             }
             if b.starts_with(b"%PDF-") {
@@ -416,6 +425,18 @@ mod tests {
         );
         assert_eq!(
             sniff_content_kind(None, Some("README.md"), None),
+            ContentKind::Markdown
+        );
+        assert_eq!(
+            sniff_content_kind(None, Some("guide.mdx"), Some(b"\xEF\xBB\xBF# Title\nBody")),
+            ContentKind::Markdown
+        );
+        assert_eq!(
+            sniff_content_kind(
+                Some("text/markdown; charset=utf-8"),
+                Some("doc.markdown"),
+                Some(b"\xEF\xBB\xBF<!-- comment -->\n# Heading\n")
+            ),
             ContentKind::Markdown
         );
         assert_eq!(

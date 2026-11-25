@@ -7,15 +7,19 @@ license = "MIT"
 repository = "https://github.com/BiteFoundry/bitefoundry-html"
 
 [features]
-default = ["js", "serve"]
+default = ["js", "serve", "graphics"]
 js = ["dep:rquickjs"]
 serve = ["dep:axum", "dep:tokio", "dep:rand"]
+graphics = ["dep:resvg", "dep:base64"]
 
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rand = { version = "0.8", optional = true }
 ratatui = "0.28"
+resvg = { version = "0.50", optional = true }
 rquickjs = { version = "0.14", features = ["classes", "array-buffer"], optional = true }
 scraper = "0.20"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"], optional = true }

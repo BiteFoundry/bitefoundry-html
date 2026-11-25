@@ -21,9 +21,93 @@ const BF_DOM_SHIM: &str = r#"
   const _cache = new Map();
   const _listeners = new Map();
   const _docListeners = new Map();
+  const _ctxCache = new Map();
+  let _timerId = 0;
+  const _timers = [];
+  const _cancelledTimers = new Set();
 
   function _toKebab(prop) {
     return String(prop).replace(/[A-Z]/g, function(m) { return '-' + m.toLowerCase(); });
+  }
+
+  function _parsePx(val, fallback) {
+    if (val === null || val === undefined || val === "") return fallback;
+    const n = parseFloat(String(val));
+    return (isFinite(n) && n > 0) ? n : fallback;
+  }
+
+  function _makeCanvas2d(id, canvasEl) {
+    let ctx2d = _ctxCache.get(id);
+    if (ctx2d) return ctx2d;
+    if (!__bf_canvas_ensure(id)) return null;
+    let _dash = [];
+    ctx2d = {
+      canvas: canvasEl,
+      get fillStyle() { return __bf_canvas_get_str(id, "fillStyle"); },
+      set fillStyle(v) { __bf_canvas_set_str(id, "fillStyle", String(v)); },
+      get strokeStyle() { return __bf_canvas_get_str(id, "strokeStyle"); },
+      set strokeStyle(v) { __bf_canvas_set_str(id, "strokeStyle", String(v)); },
+      get lineWidth() { return __bf_canvas_get_num(id, "lineWidth"); },
+      set lineWidth(v) { __bf_canvas_set_num(id, "lineWidth", Number(v)); },
+      get lineCap() { return __bf_canvas_get_str(id, "lineCap"); },
+      set lineCap(v) { __bf_canvas_set_str(id, "lineCap", String(v)); },
+      get lineJoin() { return __bf_canvas_get_str(id, "lineJoin"); },
+      set lineJoin(v) { __bf_canvas_set_str(id, "lineJoin", String(v)); },
+      get globalAlpha() { return __bf_canvas_get_num(id, "globalAlpha"); },
+      set globalAlpha(v) { __bf_canvas_set_num(id, "globalAlpha", Number(v)); },
+      get font() { return __bf_canvas_get_str(id, "font"); },
+      set font(v) { __bf_canvas_set_str(id, "font", String(v)); },
+      get textAlign() { return __bf_canvas_get_str(id, "textAlign"); },
+      set textAlign(v) { __bf_canvas_set_str(id, "textAlign", String(v)); },
+      get textBaseline() { return __bf_canvas_get_str(id, "textBaseline"); },
+      set textBaseline(v) { __bf_canvas_set_str(id, "textBaseline", String(v)); },
+      setLineDash: function(segs) {
+        if (!Array.isArray(segs)) return;
+        _dash = segs.map(Number).filter(function(n) { return isFinite(n) && n >= 0; });
+        __bf_canvas_set_dash(id, _dash);
+      },
+      getLineDash: function() { return _dash.slice(); },
+      save: function() { __bf_canvas_op0(id, "save"); },
+      restore: function() { __bf_canvas_op0(id, "restore"); },
+      translate: function(x, y) { __bf_canvas_op2(id, "translate", Number(x), Number(y)); },
+      scale: function(x, y) { __bf_canvas_op2(id, "scale", Number(x), Number(y)); },
+      rotate: function(a) { __bf_canvas_op1(id, "rotate", Number(a)); },
+      setTransform: function(a, b, c, d, e, f) {
+        __bf_canvas_op6(id, "setTransform", [Number(a), Number(b), Number(c), Number(d), Number(e), Number(f)]);
+      },
+      resetTransform: function() { __bf_canvas_op0(id, "resetTransform"); },
+      fillRect: function(x, y, w, h) { __bf_canvas_op4(id, "fillRect", Number(x), Number(y), Number(w), Number(h)); },
+      strokeRect: function(x, y, w, h) { __bf_canvas_op4(id, "strokeRect", Number(x), Number(y), Number(w), Number(h)); },
+      clearRect: function(x, y, w, h) { __bf_canvas_op4(id, "clearRect", Number(x), Number(y), Number(w), Number(h)); },
+      beginPath: function() { __bf_canvas_op0(id, "beginPath"); },
+      closePath: function() { __bf_canvas_op0(id, "closePath"); },
+      moveTo: function(x, y) { __bf_canvas_op2(id, "moveTo", Number(x), Number(y)); },
+      lineTo: function(x, y) { __bf_canvas_op2(id, "lineTo", Number(x), Number(y)); },
+      rect: function(x, y, w, h) { __bf_canvas_op4(id, "rect", Number(x), Number(y), Number(w), Number(h)); },
+      arc: function(x, y, r, s, e, ccw) {
+        __bf_canvas_op6(id, "arc", [Number(x), Number(y), Number(r), Number(s), Number(e), ccw ? 1 : 0]);
+      },
+      ellipse: function(x, y, rx, ry, rot, s, e, ccw) {
+        __bf_canvas_ellipse(id, [Number(x), Number(y), Number(rx), Number(ry), Number(rot), Number(s), Number(e), ccw ? 1 : 0]);
+      },
+      quadraticCurveTo: function(cpx, cpy, x, y) {
+        __bf_canvas_op4(id, "quadraticCurveTo", Number(cpx), Number(cpy), Number(x), Number(y));
+      },
+      bezierCurveTo: function(cp1x, cp1y, cp2x, cp2y, x, y) {
+        __bf_canvas_op6(id, "bezierCurveTo", [Number(cp1x), Number(cp1y), Number(cp2x), Number(cp2y), Number(x), Number(y)]);
+      },
+      fill: function(rule) {
+        __bf_canvas_op0(id, rule === "evenodd" ? "fillEvenOdd" : "fill");
+      },
+      stroke: function() { __bf_canvas_op0(id, "stroke"); },
+      fillText: function(text, x, y) { __bf_canvas_text(id, "fill", String(text), Number(x), Number(y)); },
+      strokeText: function(text, x, y) { __bf_canvas_text(id, "stroke", String(text), Number(x), Number(y)); },
+      measureText: function(text) {
+        return { width: __bf_canvas_measure_text(id, String(text)) };
+      }
+    };
+    _ctxCache.set(id, ctx2d);
+    return ctx2d;
   }
 
   function _wrap(id) {
@@ -142,14 +226,67 @@ const BF_DOM_SHIM: &str = r#"
       set href(v) { __bf_set_attr(id, "href", String(v)); },
       get type() { return __bf_get_attr(id, "type") || ""; },
       set type(v) { __bf_set_attr(id, "type", String(v)); },
+      get width() {
+        const attr = __bf_get_attr(id, "width");
+        const isCanvas = __bf_get_prop(id, "tagName") === "CANVAS";
+        return Math.round(_parsePx(attr, isCanvas ? 300 : 0));
+      },
+      set width(v) {
+        const w = Math.max(1, Math.round(Number(v) || 300));
+        __bf_set_attr(id, "width", String(w));
+        if (__bf_get_prop(id, "tagName") === "CANVAS") {
+          const h = Math.round(_parsePx(__bf_get_attr(id, "height"), 150));
+          __bf_canvas_resize(id, w, h);
+        }
+      },
+      get height() {
+        const attr = __bf_get_attr(id, "height");
+        const isCanvas = __bf_get_prop(id, "tagName") === "CANVAS";
+        return Math.round(_parsePx(attr, isCanvas ? 150 : 0));
+      },
+      set height(v) {
+        const h = Math.max(1, Math.round(Number(v) || 150));
+        __bf_set_attr(id, "height", String(h));
+        if (__bf_get_prop(id, "tagName") === "CANVAS") {
+          const w = Math.round(_parsePx(__bf_get_attr(id, "width"), 300));
+          __bf_canvas_resize(id, w, h);
+        }
+      },
       get parentNode() { return _wrap(__bf_get_parent(id)); },
       get parentElement() { return _wrap(__bf_get_parent(id)); },
       get children() { return __bf_get_children(id).map(_wrap).filter(Boolean); },
+      getContext: function(kind) {
+        if (String(kind).toLowerCase() === "2d" && __bf_get_prop(id, "tagName") === "CANVAS") {
+          return _makeCanvas2d(id, el);
+        }
+        return null;
+      },
+      toDataURL: function() {
+        if (__bf_get_prop(id, "tagName") === "CANVAS") {
+          return __bf_canvas_to_data_url(id);
+        }
+        return "";
+      },
+      getBoundingClientRect: function() {
+        const isCanvas = __bf_get_prop(id, "tagName") === "CANVAS";
+        const defW = isCanvas ? 300 : 600;
+        const defH = isCanvas ? 150 : 300;
+        const w = _parsePx(__bf_get_attr(id, "width") || __bf_style_get(id, "width"), defW);
+        const h = _parsePx(__bf_get_attr(id, "height") || __bf_style_get(id, "height"), defH);
+        return { x: 0, y: 0, width: w, height: h, top: 0, left: 0, right: w, bottom: h };
+      },
       getAttribute: function(name) {
         return __bf_get_attr(id, String(name));
       },
       setAttribute: function(name, val) {
-        __bf_set_attr(id, String(name), String(val));
+        const k = String(name);
+        const v = String(val);
+        __bf_set_attr(id, k, v);
+        if (__bf_get_prop(id, "tagName") === "CANVAS" && (k.toLowerCase() === "width" || k.toLowerCase() === "height")) {
+          const w = Math.round(_parsePx(__bf_get_attr(id, "width"), 300));
+          const h = Math.round(_parsePx(__bf_get_attr(id, "height"), 150));
+          __bf_canvas_resize(id, w, h);
+        }
       },
       removeAttribute: function(name) {
         __bf_remove_attr(id, String(name));
@@ -233,6 +370,19 @@ const BF_DOM_SHIM: &str = r#"
     };
   }
 
+  g.__bf_flush_timers = function() {
+    let executed = 0;
+    while (_timers.length > 0 && executed < 16) {
+      const item = _timers.shift();
+      if (_cancelledTimers.has(item.id)) {
+        _cancelledTimers.delete(item.id);
+        continue;
+      }
+      executed++;
+      item.fn();
+    }
+  };
+
   g.__bf_dispatch_event = function(nodeId, eventType, inlineCode) {
     const type = String(eventType).toLowerCase();
     const target = _wrap(nodeId);
@@ -281,6 +431,7 @@ const BF_DOM_SHIM: &str = r#"
       }
     }
 
+    g.__bf_flush_timers();
     return !!ev.defaultPrevented;
   };
 
@@ -293,6 +444,7 @@ const BF_DOM_SHIM: &str = r#"
         copy[i].call(g.document, ev);
       }
     }
+    g.__bf_flush_timers();
   };
 
   g.document = {
@@ -327,6 +479,9 @@ const BF_DOM_SHIM: &str = r#"
     createElement: function(tag) {
       return _wrap(__bf_create_el(String(tag)));
     },
+    createElementNS: function(_ns, tag) {
+      return _wrap(__bf_create_el(String(tag)));
+    },
     createTextNode: function(text) {
       return { __bf_id: __bf_create_text(String(text)), nodeType: 3 };
     },
@@ -345,6 +500,30 @@ const BF_DOM_SHIM: &str = r#"
       if (idx !== -1) list.splice(idx, 1);
     }
   };
+
+  g.setTimeout = function(fn, _delay) {
+    const tid = ++_timerId;
+    if (typeof fn === 'function') {
+      _timers.push({ id: tid, fn: fn });
+    }
+    return tid;
+  };
+  g.clearTimeout = function(tid) {
+    _cancelledTimers.add(tid);
+  };
+  g.requestAnimationFrame = function(fn) {
+    const tid = ++_timerId;
+    if (typeof fn === 'function') {
+      _timers.push({ id: tid, fn: function() { fn(16); } });
+    }
+    return tid;
+  };
+  g.cancelAnimationFrame = function(tid) {
+    _cancelledTimers.add(tid);
+  };
+  g.devicePixelRatio = 1;
+  g.innerWidth = 1024;
+  g.innerHeight = 768;
 
   g.alert = function(msg) {
     __bf_alert(msg === undefined ? "" : String(msg));
@@ -970,12 +1149,529 @@ impl JsSession {
                 });
             }
 
+            // Canvas 2D bindings (lazily allocate `CanvasSurface` under `graphics` feature).
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_ensure", move |id: i64| -> bool {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return false;
+                        }
+                        let nid = DomNodeId(id as usize);
+                        let Ok(mut s) = st.lock() else {
+                            return false;
+                        };
+                        let (w, h) = canvas_attrs_dims(&s.doc, nid);
+                        s.canvases
+                            .entry(nid)
+                            .or_insert_with(|| crate::canvas::CanvasSurface::new(w, h));
+                        true
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = id;
+                        false
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_resize", move |id: i64, w: i64, h: i64| {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return;
+                        }
+                        let nid = DomNodeId(id as usize);
+                        if let Ok(mut s) = st.lock() {
+                            if let Some(surface) = s.canvases.get_mut(&nid) {
+                                surface.resize(w.max(1) as u32, h.max(1) as u32);
+                                s.dirty = true;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, w, h);
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_get_str",
+                    move |id: i64, prop: String| -> String {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return String::new();
+                            }
+                            let Ok(s) = st.lock() else {
+                                return String::new();
+                            };
+                            let Some(surface) = s.canvases.get(&DomNodeId(id as usize)) else {
+                                return String::new();
+                            };
+                            match prop.as_str() {
+                                "fillStyle" => surface.fill_style().to_string(),
+                                "strokeStyle" => surface.stroke_style().to_string(),
+                                "font" => surface.font().to_string(),
+                                _ => String::new(),
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, prop);
+                            String::new()
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_set_str",
+                    move |id: i64, prop: String, val: String| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    match prop.as_str() {
+                                        "fillStyle" => surface.set_fill_style(&val),
+                                        "strokeStyle" => surface.set_stroke_style(&val),
+                                        "lineCap" => surface.set_line_cap(&val),
+                                        "lineJoin" => surface.set_line_join(&val),
+                                        "font" => surface.set_font(&val),
+                                        "textAlign" => surface.set_text_align(&val),
+                                        "textBaseline" => surface.set_text_baseline(&val),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, prop, val);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_get_num", move |id: i64, prop: String| -> f64 {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return 0.0;
+                        }
+                        let Ok(s) = st.lock() else {
+                            return 0.0;
+                        };
+                        let Some(surface) = s.canvases.get(&DomNodeId(id as usize)) else {
+                            return 0.0;
+                        };
+                        match prop.as_str() {
+                            "lineWidth" => surface.line_width() as f64,
+                            "globalAlpha" => surface.global_alpha() as f64,
+                            _ => 0.0,
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, prop);
+                        0.0
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_set_num",
+                    move |id: i64, prop: String, val: f64| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    match prop.as_str() {
+                                        "lineWidth" => surface.set_line_width(val as f32),
+                                        "globalAlpha" => surface.set_global_alpha(val as f32),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, prop, val);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_set_dash", move |id: i64, segs: Vec<f64>| {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return;
+                        }
+                        if let Ok(mut s) = st.lock() {
+                            if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                surface.set_line_dash(segs.into_iter().map(|v| v as f32).collect());
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, segs);
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_op0", move |id: i64, op: String| {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return;
+                        }
+                        if let Ok(mut s) = st.lock() {
+                            let mut drew = false;
+                            if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                match op.as_str() {
+                                    "save" => surface.save(),
+                                    "restore" => surface.restore(),
+                                    "resetTransform" => surface.reset_transform(),
+                                    "beginPath" => surface.begin_path(),
+                                    "closePath" => surface.close_path(),
+                                    "fill" => {
+                                        surface.fill(false);
+                                        drew = true;
+                                    }
+                                    "fillEvenOdd" => {
+                                        surface.fill(true);
+                                        drew = true;
+                                    }
+                                    "stroke" => {
+                                        surface.stroke();
+                                        drew = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if drew {
+                                s.dirty = true;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, op);
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_op1", move |id: i64, op: String, a: f64| {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return;
+                        }
+                        if let Ok(mut s) = st.lock() {
+                            if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                if op == "rotate" {
+                                    surface.rotate(a as f32);
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, op, a);
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_op2",
+                    move |id: i64, op: String, a: f64, b: f64| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    match op.as_str() {
+                                        "translate" => surface.translate(a as f32, b as f32),
+                                        "scale" => surface.scale(a as f32, b as f32),
+                                        "moveTo" => surface.move_to(a as f32, b as f32),
+                                        "lineTo" => surface.line_to(a as f32, b as f32),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, op, a, b);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_op4",
+                    move |id: i64, op: String, a: f64, b: f64, c: f64, d: f64| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                let mut drew = false;
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    match op.as_str() {
+                                        "fillRect" => {
+                                            surface.fill_rect(a as f32, b as f32, c as f32, d as f32);
+                                            drew = true;
+                                        }
+                                        "strokeRect" => {
+                                            surface.stroke_rect(a as f32, b as f32, c as f32, d as f32);
+                                            drew = true;
+                                        }
+                                        "clearRect" => {
+                                            surface.clear_rect(a as f32, b as f32, c as f32, d as f32);
+                                            drew = true;
+                                        }
+                                        "rect" => surface.rect(a as f32, b as f32, c as f32, d as f32),
+                                        "quadraticCurveTo" => surface
+                                            .quadratic_curve_to(a as f32, b as f32, c as f32, d as f32),
+                                        _ => {}
+                                    }
+                                }
+                                if drew {
+                                    s.dirty = true;
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, op, a, b, c, d);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_op6",
+                    move |id: i64, op: String, args: Vec<f64>| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 || args.len() < 6 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    match op.as_str() {
+                                        "setTransform" => surface.set_transform(
+                                            args[0] as f32,
+                                            args[1] as f32,
+                                            args[2] as f32,
+                                            args[3] as f32,
+                                            args[4] as f32,
+                                            args[5] as f32,
+                                        ),
+                                        "bezierCurveTo" => surface.bezier_curve_to(
+                                            args[0] as f32,
+                                            args[1] as f32,
+                                            args[2] as f32,
+                                            args[3] as f32,
+                                            args[4] as f32,
+                                            args[5] as f32,
+                                        ),
+                                        "arc" => surface.arc(
+                                            args[0] as f32,
+                                            args[1] as f32,
+                                            args[2] as f32,
+                                            args[3] as f32,
+                                            args[4] as f32,
+                                            args[5] != 0.0,
+                                        ),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, op, args);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_ellipse", move |id: i64, args: Vec<f64>| {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 || args.len() < 8 {
+                            return;
+                        }
+                        if let Ok(mut s) = st.lock() {
+                            if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                surface.ellipse(
+                                    args[0] as f32,
+                                    args[1] as f32,
+                                    args[2] as f32,
+                                    args[3] as f32,
+                                    args[4] as f32,
+                                    args[5] as f32,
+                                    args[6] as f32,
+                                    args[7] != 0.0,
+                                );
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = (id, args);
+                    }
+                });
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_text",
+                    move |id: i64, mode: String, text: String, x: f64, y: f64| {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return;
+                            }
+                            if let Ok(mut s) = st.lock() {
+                                let mut drew = false;
+                                if let Some(surface) = s.canvases.get_mut(&DomNodeId(id as usize)) {
+                                    if mode == "stroke" {
+                                        surface.stroke_text(&text, x as f32, y as f32);
+                                    } else {
+                                        surface.fill_text(&text, x as f32, y as f32);
+                                    }
+                                    drew = true;
+                                }
+                                if drew {
+                                    s.dirty = true;
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, mode, text, x, y);
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!(
+                    "__bf_canvas_measure_text",
+                    move |id: i64, text: String| -> f64 {
+                        #[cfg(feature = "graphics")]
+                        {
+                            if id < 0 {
+                                return 0.0;
+                            }
+                            let Ok(s) = st.lock() else {
+                                return 0.0;
+                            };
+                            s.canvases
+                                .get(&DomNodeId(id as usize))
+                                .map(|c| c.measure_text(&text) as f64)
+                                .unwrap_or(0.0)
+                        }
+                        #[cfg(not(feature = "graphics"))]
+                        {
+                            let _ = (id, text);
+                            0.0
+                        }
+                    }
+                );
+            }
+            {
+                #[cfg(feature = "graphics")]
+                let st = Arc::clone(&state);
+                bind_fn!("__bf_canvas_to_data_url", move |id: i64| -> String {
+                    #[cfg(feature = "graphics")]
+                    {
+                        if id < 0 {
+                            return String::new();
+                        }
+                        let nid = DomNodeId(id as usize);
+                        let Ok(mut s) = st.lock() else {
+                            return String::new();
+                        };
+                        let (w, h) = canvas_attrs_dims(&s.doc, nid);
+                        let surface = s
+                            .canvases
+                            .entry(nid)
+                            .or_insert_with(|| crate::canvas::CanvasSurface::new(w, h));
+                        surface.to_data_url().unwrap_or_default()
+                    }
+                    #[cfg(not(feature = "graphics"))]
+                    {
+                        let _ = id;
+                        String::new()
+                    }
+                });
+            }
+
             ctx.eval::<Value, _>(BF_DOM_SHIM)
                 .catch(&ctx)
                 .map(|_| ())
                 .map_err(|e| format!("{e}"))
         })
     }
+}
+
+#[cfg(feature = "graphics")]
+fn canvas_attrs_dims(doc: &crate::dom::DomDocument, id: DomNodeId) -> (u32, u32) {
+    let w = doc
+        .get_attr(id, "width")
+        .and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(crate::canvas::DEFAULT_CANVAS_WIDTH);
+    let h = doc
+        .get_attr(id, "height")
+        .and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(crate::canvas::DEFAULT_CANVAS_HEIGHT);
+    (w, h)
 }
 
 struct DeadlineGuard<'a> {

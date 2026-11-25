@@ -132,6 +132,7 @@ pub struct DomDocument {
     nodes: Vec<DomNode>,
     root: DomNodeId,
     scripts: Vec<String>,
+    pub external_scripts: Vec<String>,
     style_rules: Vec<StyleRule>,
     title_override: Option<String>,
 }
@@ -149,6 +150,7 @@ impl DomDocument {
             }],
             root: DomNodeId(0),
             scripts: Vec::new(),
+            external_scripts: Vec::new(),
             style_rules: Vec::new(),
             title_override: None,
         };
@@ -228,34 +230,43 @@ impl DomDocument {
             };
 
             if tag == "textarea" {
-                let txt = self.text_content(id);
+                let txt = self.text_content(id).replace("\r\n", "\n");
                 if let Some(el) = self.element_mut(id) {
                     el.value = txt;
                 }
             } else if tag == "select" {
                 self.sync_select_state(id);
             } else if collect_scripts_and_styles && tag == "script" {
-                let is_inline_js = self.element(id).is_some_and(|el| {
-                    if el.has_attr("src") {
-                        return false;
-                    }
-                    match el.get_attr("type").map(|t| t.trim().to_ascii_lowercase()) {
-                        None => true,
-                        Some(t) if t.is_empty() => true,
-                        Some(t)
-                            if t == "text/javascript"
-                                || t == "application/javascript"
-                                || t == "module" =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }
+                let script_meta = self.element(id).map(|el| {
+                    (
+                        el.get_attr("src").map(|s| s.trim().to_string()),
+                        el.get_attr("type").map(|t| t.trim().to_ascii_lowercase()),
+                    )
                 });
-                if is_inline_js {
-                    let body = self.text_content(id);
-                    if !body.trim().is_empty() {
-                        self.scripts.push(body);
+                if let Some((src_opt, type_opt)) = script_meta {
+                    if let Some(src) = src_opt.filter(|s| !s.is_empty()) {
+                        if !self.external_scripts.contains(&src) {
+                            self.external_scripts.push(src);
+                        }
+                        continue;
+                    }
+                    let is_module = matches!(type_opt.as_deref(), Some("module"));
+                    let is_js_type = matches!(
+                        type_opt.as_deref(),
+                        None | Some("") | Some("text/javascript" | "application/javascript" | "module")
+                    );
+                    if is_js_type {
+                        let body = self.text_content(id);
+                        if !body.trim().is_empty() {
+                            if is_module && looks_like_es_module_syntax(&body) {
+                                let label = "inline ES module".to_string();
+                                if !self.external_scripts.contains(&label) {
+                                    self.external_scripts.push(label);
+                                }
+                            } else {
+                                self.scripts.push(body);
+                            }
+                        }
                     }
                 }
             } else if collect_scripts_and_styles && tag == "style" {
@@ -303,42 +314,86 @@ impl DomDocument {
             }
         }
 
-        for block in clean.split('}') {
-            let Some((selectors_str, body)) = block.split_once('{') else {
-                continue;
-            };
-            let selectors_str = selectors_str.trim();
-            if selectors_str.is_empty() || selectors_str.starts_with('@') {
-                continue;
-            }
-            let mut display_none = None;
-            let mut color = None;
-            for decl in body.split(';') {
-                let Some((prop, val)) = decl.split_once(':') else {
-                    continue;
-                };
-                let prop = prop.trim().to_ascii_lowercase();
-                let val = val
-                    .trim()
-                    .trim_end_matches("!important")
-                    .trim()
-                    .to_string();
-                if prop == "display" {
-                    display_none = Some(val.eq_ignore_ascii_case("none"));
-                } else if prop == "color" && !val.is_empty() {
-                    color = Some(val);
+        // Brace-depth scanner that cleanly skips nested @media/@supports/@keyframes/@font-face blocks.
+        let bytes = clean.as_bytes();
+        let len = bytes.len();
+        let mut i = 0usize;
+        let mut selector_start = 0usize;
+
+        while i < len {
+            match bytes[i] {
+                b'"' | b'\'' => {
+                    i = skip_css_string(bytes, i);
                 }
-            }
-            if display_none.is_some() || color.is_some() {
-                for sel in selectors_str.split(',') {
-                    let sel = sel.trim();
-                    if !sel.is_empty() {
-                        self.style_rules.push(StyleRule {
-                            selector: sel.to_string(),
-                            display_none,
-                            color: color.clone(),
-                        });
+                b';' => {
+                    // Statement at-rule such as `@import ...;` or `@charset ...;`
+                    i += 1;
+                    selector_start = i;
+                }
+                b'{' => {
+                    let selectors_str = clean[selector_start..i].trim();
+                    let body_start = i + 1;
+                    let mut depth = 1usize;
+                    i += 1;
+                    while i < len && depth > 0 {
+                        match bytes[i] {
+                            b'"' | b'\'' => {
+                                i = skip_css_string(bytes, i);
+                                continue;
+                            }
+                            b'{' => depth += 1,
+                            b'}' => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
                     }
+                    let body_end = if depth == 0 { i.saturating_sub(1) } else { len };
+                    let body = &clean[body_start..body_end];
+                    selector_start = i;
+
+                    if selectors_str.is_empty() || selectors_str.starts_with('@') {
+                        // Skip nested at-rule blocks (@media, @supports, @keyframes, @font-face, etc.)
+                        continue;
+                    }
+
+                    let mut display_none = None;
+                    let mut color = None;
+                    for decl in body.split(';') {
+                        let Some((prop, val)) = decl.split_once(':') else {
+                            continue;
+                        };
+                        let prop = prop.trim().to_ascii_lowercase();
+                        let val = val
+                            .trim()
+                            .trim_end_matches("!important")
+                            .trim()
+                            .to_string();
+                        if prop == "display" {
+                            display_none = Some(val.eq_ignore_ascii_case("none"));
+                        } else if prop == "color" && !val.is_empty() {
+                            color = Some(val);
+                        }
+                    }
+                    if display_none.is_some() || color.is_some() {
+                        for sel in selectors_str.split(',') {
+                            let sel = sel.trim();
+                            if !sel.is_empty() {
+                                self.style_rules.push(StyleRule {
+                                    selector: sel.to_string(),
+                                    display_none,
+                                    color: color.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                b'}' => {
+                    // Stray closing brace at depth 0: advance safely.
+                    i += 1;
+                    selector_start = i;
+                }
+                _ => {
+                    i += 1;
                 }
             }
         }
@@ -403,6 +458,11 @@ impl DomDocument {
     /// Inline `<script>` bodies collected during parsing.
     pub fn inline_scripts(&self) -> &[String] {
         &self.scripts
+    }
+
+    /// External `<script src=...>` URLs and unsupported ES module entries recorded during parsing.
+    pub fn external_scripts(&self) -> &[String] {
+        &self.external_scripts
     }
 
     /// Returns `true` if the document contains any inline `<script>` tags or `on*` event handler attributes.
@@ -644,10 +704,21 @@ impl DomDocument {
         true
     }
 
-    /// Concatenates all descendant text node contents.
+    /// Concatenates all descendant text node contents (unfiltered; used for QuickJS `.textContent`
+    /// and `<script>`/`<style>` extraction).
     pub fn text_content(&self, id: DomNodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
+        out
+    }
+
+    /// Concatenates visible descendant text only, skipping non-visual/metadata tags
+    /// (`script`, `style`, `noscript`, `template`, `head`, `meta`, `link`, `title`,
+    /// `xml`, `o:p`, `svg`, `canvas`, `metadata`, `desc`, `ac:parameter`, `ac:plain-text-link-body`)
+    /// and effectively hidden elements.
+    pub fn visible_text_content(&self, id: DomNodeId) -> String {
+        let mut out = String::new();
+        self.collect_visible_text(id, &mut out);
         out
     }
 
@@ -660,6 +731,28 @@ impl DomDocument {
             DomNodeKind::Document | DomNodeKind::Element(_) => {
                 for &child in &node.children {
                     self.collect_text(child, out);
+                }
+            }
+        }
+    }
+
+    fn collect_visible_text(&self, id: DomNodeId, out: &mut String) {
+        let Some(node) = self.nodes.get(id.0) else {
+            return;
+        };
+        match &node.kind {
+            DomNodeKind::Text(t) => out.push_str(t),
+            DomNodeKind::Document => {
+                for &child in &node.children {
+                    self.collect_visible_text(child, out);
+                }
+            }
+            DomNodeKind::Element(el) => {
+                if is_non_visual_tag(&el.tag) || self.is_effectively_hidden(id) {
+                    return;
+                }
+                for &child in &node.children {
+                    self.collect_visible_text(child, out);
                 }
             }
         }
@@ -700,10 +793,6 @@ impl DomDocument {
         }
         let frag = Html::parse_fragment(html);
         self.ingest_scraper_tree(id, &frag, true);
-        if self.nodes[id.0].children.is_empty() && !html.is_empty() {
-            let txt = self.alloc_node(Some(id), DomNodeKind::Text(html.to_string()));
-            self.nodes[id.0].children.push(txt);
-        }
         self.finalize_subtree(id, false);
     }
 
@@ -712,41 +801,70 @@ impl DomDocument {
         let Some(node) = self.nodes.get(id.0) else {
             return String::new();
         };
+        let in_svg = self
+            .element(id)
+            .is_some_and(|e| e.tag == "svg")
+            || self.ancestor_tag(id, "svg").is_some();
         let mut out = String::new();
         for &child in &node.children {
-            self.serialize_node(child, &mut out);
+            self.serialize_node(child, in_svg, &mut out);
         }
         out
     }
 
-    fn serialize_node(&self, id: DomNodeId, out: &mut String) {
+    /// Serializes `id` itself and its entire subtree as XML/HTML-safe outer markup,
+    /// preserving canonical SVG tag and attribute casing when serializing `<svg>` trees.
+    pub fn serialize_outer_html(&self, id: DomNodeId) -> String {
+        let in_svg = self
+            .element(id)
+            .is_some_and(|e| e.tag == "svg")
+            || self.ancestor_tag(id, "svg").is_some();
+        let mut out = String::new();
+        self.serialize_node(id, in_svg, &mut out);
+        out
+    }
+
+    fn serialize_node(&self, id: DomNodeId, in_svg: bool, out: &mut String) {
         let Some(node) = self.nodes.get(id.0) else {
             return;
         };
         match &node.kind {
-            DomNodeKind::Text(t) => out.push_str(t),
+            DomNodeKind::Text(t) => {
+                escape_xml_text(t, out);
+            }
             DomNodeKind::Document => {
                 for &c in &node.children {
-                    self.serialize_node(c, out);
+                    self.serialize_node(c, in_svg, out);
                 }
             }
             DomNodeKind::Element(el) => {
+                let child_in_svg = in_svg || el.tag == "svg";
+                let tag_name = if child_in_svg {
+                    canonical_svg_tag(&el.tag)
+                } else {
+                    el.tag.as_str()
+                };
                 out.push('<');
-                out.push_str(&el.tag);
+                out.push_str(tag_name);
                 for (k, v) in &el.attrs {
+                    let attr_name = if child_in_svg {
+                        canonical_svg_attr(k)
+                    } else {
+                        k.as_str()
+                    };
                     out.push(' ');
-                    out.push_str(k);
+                    out.push_str(attr_name);
                     out.push_str("=\"");
-                    out.push_str(&v.replace('"', "&quot;"));
+                    escape_xml_attr(v, out);
                     out.push('"');
                 }
                 out.push('>');
                 if !is_void_tag(&el.tag) {
                     for &c in &node.children {
-                        self.serialize_node(c, out);
+                        self.serialize_node(c, child_in_svg, out);
                     }
                     out.push_str("</");
-                    out.push_str(&el.tag);
+                    out.push_str(tag_name);
                     out.push('>');
                 }
             }
@@ -1019,7 +1137,7 @@ impl DomDocument {
         self.collect_option_nodes(select_id)
             .into_iter()
             .map(|opt_id| {
-                let label = self.text_content(opt_id).trim().to_string();
+                let label = collapse_option_label(&self.visible_text_content(opt_id));
                 let val = self.option_value(opt_id);
                 (val, label)
             })
@@ -1054,7 +1172,7 @@ impl DomDocument {
             }
         }
         let new_val = self.option_value(options[clamped]);
-        let label = self.text_content(options[clamped]).trim().to_string();
+        let label = collapse_option_label(&self.visible_text_content(options[clamped]));
         if let Some(el) = self.element_mut(id) {
             el.selected_index = clamped;
             el.value = new_val;
@@ -1135,6 +1253,167 @@ impl DomDocument {
             }
         }
         Some((action, fields))
+    }
+}
+
+fn is_non_visual_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "script"
+            | "style"
+            | "noscript"
+            | "template"
+            | "head"
+            | "meta"
+            | "link"
+            | "title"
+            | "xml"
+            | "o:p"
+            | "svg"
+            | "canvas"
+            | "metadata"
+            | "desc"
+            | "ac:parameter"
+            | "ac:plain-text-link-body"
+    )
+}
+
+fn looks_like_es_module_syntax(code: &str) -> bool {
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("import{")
+            || trimmed.starts_with("import*")
+            || trimmed.starts_with("import\"")
+            || trimmed.starts_with("import'")
+            || trimmed.starts_with("export ")
+            || trimmed.starts_with("export{")
+            || trimmed.starts_with("export*")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn skip_css_string(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn collapse_option_label(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn escape_xml_text(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn escape_xml_attr(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn canonical_svg_tag(tag: &str) -> &str {
+    match tag {
+        "lineargradient" => "linearGradient",
+        "radialgradient" => "radialGradient",
+        "clippath" => "clipPath",
+        "foreignobject" => "foreignObject",
+        "textpath" => "textPath",
+        "fegaussianblur" => "feGaussianBlur",
+        "fedropshadow" => "feDropShadow",
+        "feoffset" => "feOffset",
+        "feblend" => "feBlend",
+        "fecolormatrix" => "feColorMatrix",
+        "fecomposite" => "feComposite",
+        "feflood" => "feFlood",
+        "femerge" => "feMerge",
+        "femergenode" => "feMergeNode",
+        "femorphology" => "feMorphology",
+        "feimage" => "feImage",
+        "fetile" => "feTile",
+        "feturbulence" => "feTurbulence",
+        "fedisplacementmap" => "feDisplacementMap",
+        "fecomponenttransfer" => "feComponentTransfer",
+        "fefuncr" => "feFuncR",
+        "fefuncg" => "feFuncG",
+        "fefuncb" => "feFuncB",
+        "fefunca" => "feFuncA",
+        "fediffuselighting" => "feDiffuseLighting",
+        "fespecularlighting" => "feSpecularLighting",
+        "fepointlight" => "fePointLight",
+        "fedistantlight" => "feDistantLight",
+        "fespotlight" => "feSpotLight",
+        "glyphref" => "glyphRef",
+        "altglyph" => "altGlyph",
+        _ => tag,
+    }
+}
+
+fn canonical_svg_attr(attr: &str) -> &str {
+    match attr {
+        "viewbox" => "viewBox",
+        "preserveaspectratio" => "preserveAspectRatio",
+        "gradientunits" => "gradientUnits",
+        "gradienttransform" => "gradientTransform",
+        "patternunits" => "patternUnits",
+        "patterncontentunits" => "patternContentUnits",
+        "patterntransform" => "patternTransform",
+        "clippathunits" => "clipPathUnits",
+        "maskunits" => "maskUnits",
+        "maskcontentunits" => "maskContentUnits",
+        "filterunits" => "filterUnits",
+        "primitiveunits" => "primitiveUnits",
+        "spreadmethod" => "spreadMethod",
+        "stddeviation" => "stdDeviation",
+        "basefrequency" => "baseFrequency",
+        "numoctaves" => "numOctaves",
+        "markerwidth" => "markerWidth",
+        "markerheight" => "markerHeight",
+        "markerunits" => "markerUnits",
+        "refx" => "refX",
+        "refy" => "refY",
+        "textlength" => "textLength",
+        "lengthadjust" => "lengthAdjust",
+        "startoffset" => "startOffset",
+        "pathlength" => "pathLength",
+        "specularconstant" => "specularConstant",
+        "specularexponent" => "specularExponent",
+        "surfacescale" => "surfaceScale",
+        "tablevalues" => "tableValues",
+        "xchannelselector" => "xChannelSelector",
+        "ychannelselector" => "yChannelSelector",
+        "edgemode" => "edgeMode",
+        "kernelmatrix" => "kernelMatrix",
+        "kernelunitlength" => "kernelUnitLength",
+        "stitchtiles" => "stitchTiles",
+        _ => attr,
     }
 }
 

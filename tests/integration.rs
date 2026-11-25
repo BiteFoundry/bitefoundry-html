@@ -224,3 +224,181 @@ async fn integration_serve_lru_eviction_and_clean_shutdown() {
 
     server.shutdown();
 }
+
+#[cfg(feature = "graphics")]
+#[test]
+fn integration_inline_svg_rasterizes_red_pixels_without_xmlns() {
+    use bitefoundry_html::{render_dom, DomDocument, GraphicKind};
+
+    let html = r##"<p>Chart:</p><svg width="100" height="50"><rect width="100" height="50" fill="#e11d48"/><text x="10" y="30" fill="#ffffff">차트</text></svg><button>After</button>"##;
+    let doc = DomDocument::parse(html);
+    let r = render_dom(&doc, 80, &HtmlTheme::dark(), None, None, false);
+
+    assert_eq!(r.graphics.len(), 1);
+    let g = &r.graphics[0];
+    assert_eq!(g.kind, GraphicKind::InlineSvg);
+    assert!(g.image_bytes.starts_with(b"\x89PNG"));
+    assert!(g.line_count >= 3 && g.line_count <= 24);
+    assert!(r.lines.len() >= g.line_start + g.line_count);
+
+    // Button after SVG sits strictly below the reserved graphic slot.
+    let btn = &r.controls[0];
+    assert!(btn.line >= g.line_start + g.line_count);
+
+    // Verify decoded PNG actually contains red pixels (`r > 200`).
+    let pixmap = resvg::tiny_skia::Pixmap::decode_png(&g.image_bytes).expect("decode SVG PNG");
+    let has_red = pixmap.pixels().iter().any(|p| p.red() > 200 && p.alpha() > 200);
+    assert!(has_red, "expected red pixels in rasterized SVG");
+}
+
+#[cfg(all(feature = "js", feature = "graphics"))]
+#[test]
+fn integration_dynamic_js_svg_and_canvas_2d_and_timers() {
+    use bitefoundry_html::GraphicKind;
+
+    // Dynamic JS SVG via document.createElementNS + requestAnimationFrame
+    let svg_html = r#"
+        <svg id="host" width="80" height="80"></svg>
+        <script>
+          requestAnimationFrame(function() {
+            var svg = document.getElementById('host');
+            var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            c.setAttribute('cx', '40');
+            c.setAttribute('cy', '40');
+            c.setAttribute('r', '30');
+            c.setAttribute('fill', '#22c55e');
+            svg.appendChild(c);
+          });
+        </script>
+    "#;
+    let mut svg_session = HtmlViewSession::new(None, svg_html.into());
+    let r_svg = svg_session.render(80, &HtmlTheme::dark(), false);
+    assert_eq!(r_svg.graphics.len(), 1);
+    assert_eq!(r_svg.graphics[0].kind, GraphicKind::InlineSvg);
+    let pm_svg = resvg::tiny_skia::Pixmap::decode_png(&r_svg.graphics[0].image_bytes)
+        .expect("decode dynamic SVG PNG");
+    assert!(
+        pm_svg.pixels().iter().any(|p| p.green() > 150 && p.alpha() > 200),
+        "dynamic JS SVG circle should render green pixels"
+    );
+
+    // Canvas 2D via QuickJS getContext('2d')
+    let canvas_html = r#"
+        <canvas id="c" width="120" height="60"></canvas>
+        <script>
+          var canvas = document.getElementById('c');
+          var rect = canvas.getBoundingClientRect();
+          var ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#e11d48';
+          ctx.fillRect(0, 0, rect.width / 2, rect.height);
+          ctx.strokeStyle = 'rgb(30, 144, 255)';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(90, 30, 18, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 12px sans-serif';
+          ctx.fillText('HI', 10, 30);
+        </script>
+    "#;
+    let mut canvas_session = HtmlViewSession::new(None, canvas_html.into());
+    assert!(canvas_session.last_js_error().is_none(), "JS error: {:?}", canvas_session.last_js_error());
+    let r_canvas = canvas_session.render(80, &HtmlTheme::dark(), false);
+    assert_eq!(r_canvas.graphics.len(), 1);
+    assert_eq!(r_canvas.graphics[0].kind, GraphicKind::Canvas2d);
+    assert!(r_canvas.graphics[0].image_bytes.starts_with(b"\x89PNG"));
+    let pm_canvas = resvg::tiny_skia::Pixmap::decode_png(&r_canvas.graphics[0].image_bytes)
+        .expect("decode canvas PNG");
+    assert!(
+        pm_canvas.pixels().iter().any(|p| p.red() > 200 && p.alpha() > 200),
+        "canvas fillRect should render red pixels"
+    );
+    assert!(
+        pm_canvas.pixels().iter().any(|p| p.blue() > 200 && p.alpha() > 200),
+        "canvas arc stroke should render blue pixels"
+    );
+}
+
+#[test]
+fn integration_external_script_banner_and_undrawn_canvas() {
+    let html = r#"
+        <script src="https://cdn.example.com/chart.min.js"></script>
+        <canvas id="chart" width="400" height="200"></canvas>
+        <p>Summary</p>
+    "#;
+    let mut session = HtmlViewSession::new(None, html.into());
+    assert!(!session.js_active, "external script must not spawn QuickJS");
+    let r = session.render(80, &HtmlTheme::dark(), false);
+    assert_eq!(r.external_scripts, vec!["https://cdn.example.com/chart.min.js"]);
+    assert!(r.graphics.is_empty());
+    let text = rendered_text(&r.lines);
+    assert!(text.contains("chart.min.js"));
+    assert!(text.contains("Press 'o'"));
+    assert!(text.contains("Summary"));
+}
+
+#[cfg(feature = "graphics")]
+#[test]
+fn integration_data_image_uris_and_spoof_rejection() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use bitefoundry_html::{render_dom, DomDocument, GraphicKind};
+
+    let mut pm = resvg::tiny_skia::Pixmap::new(4, 4).unwrap();
+    pm.fill(resvg::tiny_skia::Color::from_rgba8(10, 120, 240, 255));
+    let png_b64 = STANDARD.encode(pm.encode_png().unwrap());
+
+    let html = format!(
+        r#"
+        <img alt="ValidPng" src="data:image/png;base64,{png_b64}" />
+        <img alt="ValidSvg" src="data:image/svg+xml,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%3E%3Crect%20width%3D%2220%22%20height%3D%2220%22%20fill%3D%22green%22/%3E%3C/svg%3E" />
+        <img alt="Spoofed" src="data:image/png;base64,PGh0bWw+PGJvZHk+bm9wZTwvYm9keT48L2h0bWw+" />
+        "#
+    );
+    let doc = DomDocument::parse(&html);
+    let r = render_dom(&doc, 80, &HtmlTheme::dark(), None, None, false);
+    assert_eq!(r.graphics.len(), 2, "valid PNG and SVG data URIs must emit 2 graphics, spoofed rejected");
+    assert_eq!(r.graphics[0].kind, GraphicKind::DataImage);
+    assert_eq!(r.graphics[1].kind, GraphicKind::DataImage);
+    assert!(r.graphics[0].image_bytes.starts_with(b"\x89PNG"));
+    assert!(r.graphics[1].image_bytes.starts_with(b"\x89PNG"));
+    let text = rendered_text(&r.lines);
+    assert!(text.contains("[🖼 Spoofed]"));
+}
+
+#[test]
+fn markdown_html_session_raw_toggle_and_serve_html() {
+    use bitefoundry_html::{HtmlEffect, SourceKind};
+
+    let md = "---\ntitle: Guide\n---\n# Guide\n\nRead [Docs](https://bitefoundry.dev) now.";
+    let mut session = HtmlViewSession::from_content(None, ContentKind::Markdown, md.into());
+    assert_eq!(session.source_kind(), SourceKind::Markdown);
+    assert!(!session.js_active, "Markdown session must never allocate QuickJS");
+
+    let theme = HtmlTheme::dark();
+    let r0 = session.render(80, &theme, false);
+    let t0 = rendered_text(&r0.lines);
+    assert!(t0.contains("title: Guide"));
+    assert!(t0.contains("Docs"));
+    assert!(!t0.contains("[Docs]("));
+    assert_eq!(r0.controls.len(), 1);
+
+    // Click Markdown link control -> emits HtmlEffect::OpenUrl
+    let link = r0.controls[0].clone();
+    let effs = session.click_at(link.line, link.col_start);
+    assert!(effs.contains(&HtmlEffect::OpenUrl("https://bitefoundry.dev".into())));
+
+    // Raw mode toggle shows raw Markdown source
+    assert!(session.toggle_raw_mode());
+    let r_raw = session.render(80, &theme, false);
+    let t_raw = rendered_text(&r_raw.lines);
+    assert!(t_raw.contains("# Guide"));
+    assert!(t_raw.contains("[Docs](https://bitefoundry.dev)"));
+    assert!(r_raw.controls.is_empty());
+
+    // serve_html() returns valid standalone HTML5 document
+    let served = session.serve_html();
+    assert!(served.starts_with("<!DOCTYPE html>"));
+    assert!(served.contains("<title>Guide</title>"));
+    assert!(served.contains("https://bitefoundry.dev"));
+}

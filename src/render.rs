@@ -1,10 +1,25 @@
-//! Ratatui interactive HTML renderer with exact hit-map coordinates.
+//! Ratatui interactive HTML renderer with exact hit-map coordinates,
+//! lossless Track D wrapping/tables, and Pure-Rust inline graphic slots.
+
+#[cfg(feature = "graphics")]
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
+#[cfg(feature = "graphics")]
+use crate::canvas::CanvasSurface;
 use crate::dom::{DomDocument, DomNodeId, DomNodeKind, ElementData};
+#[cfg(feature = "graphics")]
+use crate::graphics::{
+    decode_data_image_uri, probe_raster_dimensions, rasterize_svg_to_png, RasterizedImage,
+};
+use crate::layout::{
+    render_wrapped_table, windowed_single_line_input, wrap_styled_spans, TableAlign, TableBorder,
+    TableSpec, WrapPrefix,
+};
 
 /// Plain `ratatui::style::Color` theme for HTML rendering so any BiteFoundry app can pass its palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,16 +133,127 @@ pub struct InteractiveControl {
     pub col_end: u16,
 }
 
+/// Classification of an inline graphic embedded in an HTML document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicKind {
+    InlineSvg,
+    Canvas2d,
+    DataImage,
+}
+
+/// Rasterized or decoded inline graphic occupying a reserved vertical slot in [`RenderedHtml::lines`].
+#[derive(Debug, Clone)]
+pub struct RenderedGraphic {
+    pub node_id: DomNodeId,
+    pub kind: GraphicKind,
+    pub alt: Option<String>,
+    /// Starting line index in [`RenderedHtml::lines`].
+    pub line_start: usize,
+    /// Number of placeholder rows reserved in [`RenderedHtml::lines`].
+    pub line_count: usize,
+    pub width_px: u32,
+    pub height_px: u32,
+    /// PNG bytes (from `resvg`/`tiny-skia`) or verified raster bytes (from `data:image/*`).
+    pub image_bytes: Arc<[u8]>,
+}
+
 /// Complete rendered output for a document at a given viewport width.
 #[derive(Debug, Clone)]
 pub struct RenderedHtml {
     pub title: Option<String>,
     pub lines: Vec<Line<'static>>,
     pub controls: Vec<InteractiveControl>,
+    pub graphics: Vec<RenderedGraphic>,
+    pub external_scripts: Vec<String>,
 }
 
-/// Renders a [`DomDocument`] into wrapped Ratatui lines and clickable control coordinates.
+/// Renders a [`DomDocument`] into wrapped Ratatui lines, clickable control coordinates,
+/// and inline graphic slots.
 pub fn render_dom(
+    doc: &DomDocument,
+    width: u16,
+    theme: &HtmlTheme,
+    focused_control: Option<usize>,
+    editing_input: Option<DomNodeId>,
+    show_link_urls: bool,
+) -> RenderedHtml {
+    #[cfg(feature = "graphics")]
+    {
+        render_dom_with_graphics(
+            doc,
+            width,
+            theme,
+            focused_control,
+            editing_input,
+            show_link_urls,
+            None,
+            None,
+            0,
+        )
+    }
+    #[cfg(not(feature = "graphics"))]
+    {
+        render_dom_internal(
+            doc,
+            width,
+            theme,
+            focused_control,
+            editing_input,
+            show_link_urls,
+        )
+    }
+}
+
+#[cfg(feature = "graphics")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_dom_with_graphics(
+    doc: &DomDocument,
+    width: u16,
+    theme: &HtmlTheme,
+    focused_control: Option<usize>,
+    editing_input: Option<DomNodeId>,
+    show_link_urls: bool,
+    canvases: Option<&HashMap<DomNodeId, CanvasSurface>>,
+    graphic_cache: Option<&mut HashMap<(u64, DomNodeId), RasterizedImage>>,
+    dom_version: u64,
+) -> RenderedHtml {
+    let max_width = width.max(12) as usize;
+    let mut ctx = RenderCtx {
+        doc,
+        width: max_width,
+        theme,
+        focused_control,
+        editing_input,
+        show_link_urls,
+        lines: Vec::new(),
+        controls: Vec::new(),
+        graphics: Vec::new(),
+        cur_spans: Vec::new(),
+        cur_col: 0,
+        prefix_stack: Vec::new(),
+        prefix_emitted: false,
+        canvases,
+        graphic_cache,
+        dom_version,
+    };
+
+    ctx.emit_external_scripts_banner();
+    let base_style = Style::default().fg(theme.text);
+    ctx.render_children(doc.root(), base_style);
+    ctx.flush_line(false);
+    ctx.trim_trailing_empty_lines();
+
+    RenderedHtml {
+        title: doc.title(),
+        lines: ctx.lines,
+        controls: ctx.controls,
+        graphics: ctx.graphics,
+        external_scripts: doc.external_scripts().to_vec(),
+    }
+}
+
+#[cfg(not(feature = "graphics"))]
+fn render_dom_internal(
     doc: &DomDocument,
     width: u16,
     theme: &HtmlTheme,
@@ -145,33 +271,30 @@ pub fn render_dom(
         show_link_urls,
         lines: Vec::new(),
         controls: Vec::new(),
+        graphics: Vec::new(),
         cur_spans: Vec::new(),
         cur_col: 0,
         prefix_stack: Vec::new(),
         prefix_emitted: false,
     };
 
+    ctx.emit_external_scripts_banner();
     let base_style = Style::default().fg(theme.text);
     ctx.render_children(doc.root(), base_style);
     ctx.flush_line(false);
-
-    // Trim trailing empty lines.
-    while ctx
-        .lines
-        .last()
-        .is_some_and(|line| line.spans.iter().all(|s| s.content.trim().is_empty()))
-    {
-        ctx.lines.pop();
-    }
+    ctx.trim_trailing_empty_lines();
 
     RenderedHtml {
         title: doc.title(),
         lines: ctx.lines,
         controls: ctx.controls,
+        graphics: ctx.graphics,
+        external_scripts: doc.external_scripts().to_vec(),
     }
 }
 
-/// Renders raw HTML source with lightweight syntax coloring for the Rendered ↔ Raw toggle.
+/// Renders raw HTML source with lightweight syntax coloring for the Rendered ↔ Raw toggle,
+/// expanding `\t` to 4 columns and wrapping losslessly via [`wrap_styled_spans`].
 pub fn render_raw_html(raw: &str, width: u16, theme: &HtmlTheme) -> Vec<Line<'static>> {
     let max_width = width.max(12) as usize;
     let mut lines = Vec::new();
@@ -187,8 +310,7 @@ pub fn render_raw_html(raw: &str, width: u16, theme: &HtmlTheme) -> Vec<Line<'st
             lines.push(Line::default());
             continue;
         }
-        // Tokenize tags vs text on each line, then wrap cleanly to `max_width`.
-        let mut tokens: Vec<(String, Style)> = Vec::new();
+        let mut spans: Vec<Span<'static>> = Vec::new();
         let mut chars = raw_line.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '<' {
@@ -201,21 +323,18 @@ pub fn render_raw_html(raw: &str, width: u16, theme: &HtmlTheme) -> Vec<Line<'st
                     }
                 }
                 if buf.starts_with("<!--") {
-                    tokens.push((buf, muted_style));
-                } else {
-                    // Split tag name and attributes
-                    if let Some(ws) = buf.find(char::is_whitespace) {
-                        tokens.push((buf[..ws].to_string(), tag_style));
-                        let rest = &buf[ws..];
-                        if let Some(stripped) = rest.strip_suffix('>') {
-                            tokens.push((stripped.to_string(), attr_style));
-                            tokens.push((">".to_string(), tag_style));
-                        } else {
-                            tokens.push((rest.to_string(), attr_style));
-                        }
+                    spans.push(Span::styled(buf, muted_style));
+                } else if let Some(ws) = buf.find(char::is_whitespace) {
+                    spans.push(Span::styled(buf[..ws].to_string(), tag_style));
+                    let rest = &buf[ws..];
+                    if let Some(stripped) = rest.strip_suffix('>') {
+                        spans.push(Span::styled(stripped.to_string(), attr_style));
+                        spans.push(Span::styled(">".to_string(), tag_style));
                     } else {
-                        tokens.push((buf, tag_style));
+                        spans.push(Span::styled(rest.to_string(), attr_style));
                     }
+                } else {
+                    spans.push(Span::styled(buf, tag_style));
                 }
             } else {
                 let mut buf = String::new();
@@ -227,32 +346,11 @@ pub fn render_raw_html(raw: &str, width: u16, theme: &HtmlTheme) -> Vec<Line<'st
                     buf.push(nc);
                     chars.next();
                 }
-                tokens.push((buf, text_style));
+                spans.push(Span::styled(buf, text_style));
             }
         }
 
-        // Wrap tokens to max_width
-        let mut cur_spans: Vec<Span<'static>> = Vec::new();
-        let mut col = 0usize;
-        for (text, style) in tokens {
-            let mut seg = String::new();
-            for ch in text.chars() {
-                let w = ch.width().unwrap_or(1);
-                if col + w > max_width && col > 0 {
-                    if !seg.is_empty() {
-                        cur_spans.push(Span::styled(std::mem::take(&mut seg), style));
-                    }
-                    lines.push(Line::from(std::mem::take(&mut cur_spans)));
-                    col = 0;
-                }
-                seg.push(ch);
-                col += w;
-            }
-            if !seg.is_empty() {
-                cur_spans.push(Span::styled(seg, style));
-            }
-        }
-        lines.push(Line::from(cur_spans));
+        lines.extend(wrap_styled_spans(&spans, max_width, WrapPrefix::empty()));
     }
 
     lines
@@ -267,13 +365,76 @@ struct RenderCtx<'a> {
     show_link_urls: bool,
     lines: Vec<Line<'static>>,
     controls: Vec<InteractiveControl>,
+    graphics: Vec<RenderedGraphic>,
     cur_spans: Vec<Span<'static>>,
     cur_col: usize,
     prefix_stack: Vec<(String, Style)>,
     prefix_emitted: bool,
+    #[cfg(feature = "graphics")]
+    canvases: Option<&'a HashMap<DomNodeId, CanvasSurface>>,
+    #[cfg(feature = "graphics")]
+    graphic_cache: Option<&'a mut HashMap<(u64, DomNodeId), RasterizedImage>>,
+    #[cfg(feature = "graphics")]
+    dom_version: u64,
 }
 
 impl<'a> RenderCtx<'a> {
+    fn emit_external_scripts_banner(&mut self) {
+        let scripts = self.doc.external_scripts();
+        if scripts.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for src in scripts.iter().take(2) {
+            let short = src
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(src)
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(src);
+            names.push(short.to_string());
+        }
+        if scripts.len() > 2 {
+            names.push(format!("+{} more", scripts.len() - 2));
+        }
+        let banner = format!(
+            "ℹ External script(s) skipped ({}) · Press 'o' for full Browser view",
+            names.join(", ")
+        );
+        let style = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::ITALIC);
+        let wrapped = wrap_styled_spans(&[Span::styled(banner, style)], self.width, WrapPrefix::empty());
+        self.lines.extend(wrapped);
+        self.lines.push(Line::default());
+    }
+
+    fn trim_trailing_empty_lines(&mut self) {
+        let min_len = self
+            .graphics
+            .iter()
+            .map(|g| g.line_start + g.line_count)
+            .max()
+            .unwrap_or(0);
+        while self.lines.len() > min_len
+            && self
+                .lines
+                .last()
+                .is_some_and(|line| line.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            self.lines.pop();
+        }
+    }
+
+    fn prefix_spans(&self) -> Vec<Span<'static>> {
+        self.prefix_stack
+            .iter()
+            .map(|(text, style)| Span::styled(text.clone(), *style))
+            .collect()
+    }
+
     fn prefix_width(&self) -> usize {
         self.prefix_stack
             .iter()
@@ -323,7 +484,6 @@ impl<'a> RenderCtx<'a> {
             return;
         }
 
-        // Split into alternating whitespace and non-whitespace tokens.
         let mut iter = collapsed.chars().peekable();
         while iter.peek().is_some() {
             let is_ws = iter.peek().is_some_and(|c| c.is_whitespace());
@@ -338,7 +498,6 @@ impl<'a> RenderCtx<'a> {
             }
 
             if is_ws {
-                // Don't emit leading whitespace at the start of a line (after prefix).
                 if !self.prefix_emitted || self.cur_col <= self.prefix_width() {
                     continue;
                 }
@@ -361,27 +520,28 @@ impl<'a> RenderCtx<'a> {
                 self.cur_spans.push(Span::styled(token, style));
                 self.cur_col += tok_w;
             } else {
-                // Word wider than line: split by character width.
-                if self.cur_col > self.prefix_width() && self.cur_col + 1 > self.width {
+                // Lossless wrap for tokens wider than line budget via `wrap_styled_spans`.
+                if self.cur_col > self.prefix_width() {
                     self.flush_line(false);
-                    self.ensure_prefix();
                 }
-                let mut seg = String::new();
-                for ch in token.chars() {
-                    let cw = ch.width().unwrap_or(1);
-                    if self.cur_col + cw > self.width && self.cur_col > self.prefix_width() {
-                        if !seg.is_empty() {
-                            self.cur_spans
-                                .push(Span::styled(std::mem::take(&mut seg), style));
-                        }
-                        self.flush_line(false);
-                        self.ensure_prefix();
+                let pfx = self.prefix_spans();
+                let wrapped = wrap_styled_spans(
+                    &[Span::styled(token, style)],
+                    self.width,
+                    WrapPrefix {
+                        first: &pfx,
+                        cont: &pfx,
+                    },
+                );
+                let mut iter_lines = wrapped.into_iter().peekable();
+                while let Some(line) = iter_lines.next() {
+                    if iter_lines.peek().is_some() {
+                        self.lines.push(line);
+                    } else {
+                        self.cur_col = line.width();
+                        self.cur_spans = line.spans;
+                        self.prefix_emitted = true;
                     }
-                    seg.push(ch);
-                    self.cur_col += cw;
-                }
-                if !seg.is_empty() {
-                    self.cur_spans.push(Span::styled(seg, style));
                 }
             }
         }
@@ -417,21 +577,98 @@ impl<'a> RenderCtx<'a> {
             self.ensure_prefix();
         }
 
-        let line = self.lines.len();
-        let col_start = self.cur_col as u16;
-        let col_end = (self.cur_col + w) as u16;
+        if self.cur_col + w <= self.width {
+            let line = self.lines.len();
+            let col_start = self.cur_col as u16;
+            let col_end = (self.cur_col + w).min(self.width) as u16;
 
-        self.cur_spans.push(Span::styled(display_text, style));
-        self.cur_col += w;
+            self.cur_spans.push(Span::styled(display_text, style));
+            self.cur_col += w;
+
+            self.controls.push(InteractiveControl {
+                index: idx,
+                node_id,
+                kind,
+                label,
+                line,
+                col_start,
+                col_end,
+            });
+            return;
+        }
+
+        // Control text itself exceeds available line width: wrap losslessly across multiple lines
+        // while keeping `col_end <= self.width` and preserving exact hit coordinates.
+        if self.cur_col > self.prefix_width() {
+            self.flush_line(false);
+        }
+        let pfx = self.prefix_spans();
+        let pfx_w = self.prefix_width().min(self.width.saturating_sub(2));
+        let wrapped = wrap_styled_spans(
+            &[Span::styled(display_text, style)],
+            self.width,
+            WrapPrefix {
+                first: &pfx,
+                cont: &pfx,
+            },
+        );
+        let first_line_idx = self.lines.len();
+        let first_line_w = wrapped
+            .first()
+            .map(Line::width)
+            .unwrap_or(pfx_w)
+            .min(self.width);
+        let col_start = pfx_w.min(first_line_w) as u16;
+        let col_end = first_line_w as u16;
+
+        let mut iter_lines = wrapped.into_iter().peekable();
+        while let Some(line) = iter_lines.next() {
+            if iter_lines.peek().is_some() {
+                self.lines.push(line);
+            } else {
+                self.cur_col = line.width();
+                self.cur_spans = line.spans;
+                self.prefix_emitted = true;
+            }
+        }
 
         self.controls.push(InteractiveControl {
             index: idx,
             node_id,
             kind,
             label,
-            line,
+            line: first_line_idx,
             col_start,
             col_end,
+        });
+    }
+
+    #[cfg(feature = "graphics")]
+    fn emit_graphic_slot(
+        &mut self,
+        node_id: DomNodeId,
+        kind: GraphicKind,
+        alt: Option<String>,
+        width_px: u32,
+        height_px: u32,
+        image_bytes: Arc<[u8]>,
+    ) {
+        self.ensure_block_break(false);
+        let line_start = self.lines.len();
+        let avail_cols = self.width.saturating_sub(self.prefix_width()).max(8);
+        let line_count = compute_graphic_rows(width_px, height_px, avail_cols);
+        for _ in 0..line_count {
+            self.lines.push(Line::default());
+        }
+        self.graphics.push(RenderedGraphic {
+            node_id,
+            kind,
+            alt,
+            line_start,
+            line_count,
+            width_px,
+            height_px,
+            image_bytes,
         });
     }
 
@@ -456,10 +693,23 @@ impl<'a> RenderCtx<'a> {
     }
 
     fn render_element(&mut self, id: DomNodeId, el: &ElementData, inherited_style: Style) {
-        // Skip non-visual and hidden elements.
+        // Skip non-visual, metadata, and hidden elements.
         if matches!(
             el.tag.as_str(),
-            "script" | "style" | "noscript" | "template" | "head" | "meta" | "link" | "title"
+            "script"
+                | "style"
+                | "noscript"
+                | "template"
+                | "head"
+                | "meta"
+                | "link"
+                | "title"
+                | "xml"
+                | "o:p"
+                | "metadata"
+                | "desc"
+                | "ac:parameter"
+                | "ac:plain-text-link-body"
         ) || self.doc.is_effectively_hidden(id)
         {
             return;
@@ -548,35 +798,26 @@ impl<'a> RenderCtx<'a> {
             }
             "pre" => {
                 self.ensure_block_break(true);
-                let raw = self.doc.text_content(id);
+                let raw = self.doc.visible_text_content(id);
                 let code_style = Style::default()
                     .fg(self.theme.code_fg)
                     .bg(self.theme.code_bg);
-                self.prefix_stack.push((
+                let mut pre_prefix = self.prefix_spans();
+                pre_prefix.push(Span::styled(
                     "  │ ".to_string(),
                     Style::default().fg(self.theme.border),
                 ));
-                for line in raw.replace("\r\n", "\n").trim_matches('\n').split('\n') {
-                    self.ensure_prefix();
-                    let avail = self.width.saturating_sub(self.prefix_width()).max(4);
-                    let mut seg = String::new();
-                    let mut seg_w = 0usize;
-                    for ch in line.chars() {
-                        let cw = ch.width().unwrap_or(1);
-                        if seg_w + cw > avail && seg_w > 0 {
-                            self.cur_spans
-                                .push(Span::styled(std::mem::take(&mut seg), code_style));
-                            self.flush_line(false);
-                            self.ensure_prefix();
-                            seg_w = 0;
-                        }
-                        seg.push(ch);
-                        seg_w += cw;
-                    }
-                    self.cur_spans.push(Span::styled(seg, code_style));
-                    self.flush_line(true);
-                }
-                self.prefix_stack.pop();
+                let trimmed = raw.replace("\r\n", "\n");
+                let body = trimmed.trim_matches('\n');
+                let wrapped = wrap_styled_spans(
+                    &[Span::styled(body.to_string(), code_style)],
+                    self.width,
+                    WrapPrefix {
+                        first: &pre_prefix,
+                        cont: &pre_prefix,
+                    },
+                );
+                self.lines.extend(wrapped);
                 self.ensure_block_break(true);
             }
             "blockquote" => {
@@ -620,20 +861,26 @@ impl<'a> RenderCtx<'a> {
                 self.render_list_item(id, "• ".to_string(), style);
             }
             "table" => {
-                self.render_table(id, style);
+                if self.should_linearize_table(id) {
+                    self.ensure_block_break(false);
+                    self.render_children(id, style);
+                    self.ensure_block_break(false);
+                } else {
+                    self.render_table(id, style);
+                }
+            }
+            "svg" => {
+                self.render_svg_element(id, el);
+            }
+            "canvas" => {
+                self.render_canvas_element(id, el);
             }
             "img" => {
-                let alt = el.get_attr("alt").unwrap_or("").trim();
-                let txt = if alt.is_empty() {
-                    "[🖼 image]".to_string()
-                } else {
-                    format!("[🖼 {alt}]")
-                };
-                self.push_inline_text(&txt, Style::default().fg(self.theme.muted));
+                self.render_img_element(id, el);
             }
             "a" => {
                 let href = el.get_attr("href").unwrap_or("").to_string();
-                let raw_label = self.doc.text_content(id);
+                let raw_label = self.doc.visible_text_content(id);
                 let label = collapse_html_ws(&raw_label).trim().to_string();
                 let shown = if label.is_empty() {
                     if href.is_empty() {
@@ -642,7 +889,7 @@ impl<'a> RenderCtx<'a> {
                         href.clone()
                     }
                 } else {
-                    label.clone()
+                    label
                 };
                 if href.is_empty() {
                     self.render_children(id, style);
@@ -667,7 +914,7 @@ impl<'a> RenderCtx<'a> {
                 }
             }
             "button" => {
-                let raw_label = self.doc.text_content(id);
+                let raw_label = self.doc.visible_text_content(id);
                 let label = collapse_html_ws(&raw_label).trim().to_string();
                 let label = if label.is_empty() {
                     "Button".to_string()
@@ -691,7 +938,7 @@ impl<'a> RenderCtx<'a> {
                     .find(|&c| self.doc.element(c).is_some_and(|e| e.tag == "summary"));
 
                 let (ctrl_id, summary_label) = if let Some(sid) = summary_id {
-                    let lbl = collapse_html_ws(&self.doc.text_content(sid))
+                    let lbl = collapse_html_ws(&self.doc.visible_text_content(sid))
                         .trim()
                         .to_string();
                     (
@@ -736,19 +983,7 @@ impl<'a> RenderCtx<'a> {
                 self.render_input(id, el);
             }
             "textarea" => {
-                let value = el.value.clone();
-                let editing = self.editing_input == Some(id);
-                let shown = format_input_box(&value, el.get_attr("placeholder"), editing, 20);
-                let input_style = Style::default()
-                    .fg(self.theme.control_fg)
-                    .bg(self.theme.control_bg);
-                self.emit_control(
-                    id,
-                    ControlKind::TextInput { value },
-                    el.get_attr("name").unwrap_or("textarea").to_string(),
-                    shown,
-                    input_style,
-                );
+                self.render_textarea(id, el);
             }
             "select" => {
                 let options = self.doc.select_options(id);
@@ -779,6 +1014,265 @@ impl<'a> RenderCtx<'a> {
                 self.render_children(id, style);
             }
         }
+    }
+
+    fn render_svg_element(&mut self, id: DomNodeId, el: &ElementData) {
+        let alt = el
+            .get_attr("aria-label")
+            .or_else(|| el.get_attr("title"))
+            .map(ToString::to_string);
+        #[cfg(feature = "graphics")]
+        {
+            let cached = self
+                .graphic_cache
+                .as_deref()
+                .and_then(|c| c.get(&(self.dom_version, id)).cloned());
+            let rasterized = if let Some(hit) = cached {
+                Ok(hit)
+            } else {
+                let svg_markup = self.doc.serialize_outer_html(id);
+                let max_px_w = ((self.width as u32) * 12).clamp(256, 1600);
+                let res = rasterize_svg_to_png(svg_markup.as_bytes(), max_px_w, 1200, None);
+                if let (Ok(ref img), Some(cache)) = (&res, self.graphic_cache.as_deref_mut()) {
+                    cache.insert((self.dom_version, id), img.clone());
+                }
+                res
+            };
+
+            match rasterized {
+                Ok(img) => {
+                    self.emit_graphic_slot(
+                        id,
+                        GraphicKind::InlineSvg,
+                        alt,
+                        img.width_px,
+                        img.height_px,
+                        img.png_bytes,
+                    );
+                }
+                Err(_) => {
+                    self.push_inline_text(
+                        "[◇ SVG unavailable · Press 'o' for Browser]",
+                        Style::default().fg(self.theme.muted),
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "graphics"))]
+        {
+            let _ = (id, alt);
+            self.push_inline_text(
+                "[◇ SVG graphic · Press 'o' for Browser]",
+                Style::default().fg(self.theme.muted),
+            );
+        }
+    }
+
+    fn render_canvas_element(&mut self, id: DomNodeId, el: &ElementData) {
+        let alt = el
+            .get_attr("aria-label")
+            .or_else(|| el.get_attr("id"))
+            .map(ToString::to_string);
+        #[cfg(feature = "graphics")]
+        {
+            if let Some(surface) = self.canvases.and_then(|m| m.get(&id)) {
+                if surface.has_drawn {
+                    let cached = self
+                        .graphic_cache
+                        .as_deref()
+                        .and_then(|c| c.get(&(self.dom_version, id)).cloned());
+                    let rasterized = if let Some(hit) = cached {
+                        Ok(hit)
+                    } else {
+                        surface.encode_png().map(|png| {
+                            let img = RasterizedImage {
+                                png_bytes: Arc::from(png),
+                                width_px: surface.width(),
+                                height_px: surface.height(),
+                            };
+                            if let Some(cache) = self.graphic_cache.as_deref_mut() {
+                                cache.insert((self.dom_version, id), img.clone());
+                            }
+                            img
+                        })
+                    };
+                    if let Ok(img) = rasterized {
+                        self.emit_graphic_slot(
+                            id,
+                            GraphicKind::Canvas2d,
+                            alt,
+                            img.width_px,
+                            img.height_px,
+                            img.png_bytes,
+                        );
+                        return;
+                    }
+                }
+            }
+            let msg = if !self.doc.external_scripts().is_empty() {
+                "[▣ Canvas (external script) · Press 'o' for Browser]"
+            } else {
+                "[▣ Empty canvas]"
+            };
+            self.push_inline_text(msg, Style::default().fg(self.theme.muted));
+        }
+        #[cfg(not(feature = "graphics"))]
+        {
+            let _ = (id, alt);
+            let msg = if !self.doc.external_scripts().is_empty() {
+                "[▣ Canvas (external script) · Press 'o' for Browser]"
+            } else {
+                "[▣ Canvas · Press 'o' for Browser]"
+            };
+            self.push_inline_text(msg, Style::default().fg(self.theme.muted));
+        }
+    }
+
+    fn render_img_element(&mut self, id: DomNodeId, el: &ElementData) {
+        let alt_str = el.get_attr("alt").unwrap_or("").trim();
+        let src = el.get_attr("src").unwrap_or("").trim();
+
+        #[cfg(feature = "graphics")]
+        if src.len() >= 11 && src[..11].eq_ignore_ascii_case("data:image/") {
+            let alt = (!alt_str.is_empty()).then(|| alt_str.to_string());
+            let cached = self
+                .graphic_cache
+                .as_deref()
+                .and_then(|c| c.get(&(self.dom_version, id)).cloned());
+            if let Some(img) = cached {
+                self.emit_graphic_slot(
+                    id,
+                    GraphicKind::DataImage,
+                    alt,
+                    img.width_px,
+                    img.height_px,
+                    img.png_bytes,
+                );
+                return;
+            }
+            if let Ok(decoded) = decode_data_image_uri(src) {
+                if decoded.is_svg {
+                    let max_px_w = ((self.width as u32) * 12).clamp(256, 1600);
+                    if let Ok(img) = rasterize_svg_to_png(&decoded.bytes, max_px_w, 1200, None) {
+                        if let Some(cache) = self.graphic_cache.as_deref_mut() {
+                            cache.insert((self.dom_version, id), img.clone());
+                        }
+                        self.emit_graphic_slot(
+                            id,
+                            GraphicKind::DataImage,
+                            alt,
+                            img.width_px,
+                            img.height_px,
+                            img.png_bytes,
+                        );
+                        return;
+                    }
+                } else {
+                    let (w, h) = probe_raster_dimensions(&decoded.bytes).unwrap_or((300, 150));
+                    let bytes: Arc<[u8]> = Arc::from(decoded.bytes);
+                    if let Some(cache) = self.graphic_cache.as_deref_mut() {
+                        cache.insert(
+                            (self.dom_version, id),
+                            RasterizedImage {
+                                png_bytes: Arc::clone(&bytes),
+                                width_px: w,
+                                height_px: h,
+                            },
+                        );
+                    }
+                    self.emit_graphic_slot(id, GraphicKind::DataImage, alt, w, h, bytes);
+                    return;
+                }
+            }
+        }
+
+        #[cfg(not(feature = "graphics"))]
+        let _ = (id, src);
+
+        let txt = if alt_str.is_empty() {
+            "[🖼 image]".to_string()
+        } else {
+            format!("[🖼 {alt_str}]")
+        };
+        self.push_inline_text(&txt, Style::default().fg(self.theme.muted));
+    }
+
+    fn render_textarea(&mut self, id: DomNodeId, el: &ElementData) {
+        self.ensure_block_break(false);
+        let value = el.value.clone();
+        let editing = self.editing_input == Some(id);
+        let idx = self.controls.len();
+        let is_focused = self.focused_control == Some(idx);
+
+        let base_style = Style::default()
+            .fg(self.theme.control_fg)
+            .bg(self.theme.control_bg);
+        let style = if is_focused {
+            if self.theme.focus_bg == Color::Reset && self.theme.focus_fg == Color::Reset {
+                base_style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(self.theme.focus_fg)
+                    .bg(self.theme.focus_bg)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            base_style
+        };
+
+        let raw_text = if !value.is_empty() {
+            if editing {
+                format!("{value}▏")
+            } else {
+                value.clone()
+            }
+        } else if editing {
+            "▏".to_string()
+        } else if let Some(ph) = el.get_attr("placeholder").filter(|p| !p.trim().is_empty()) {
+            ph.trim().to_string()
+        } else {
+            String::new()
+        };
+
+        let pfx = self.prefix_spans();
+        let pfx_w = self.prefix_width();
+        let inner_max = self.width.saturating_sub(pfx_w + 4).max(4);
+        let wrapped = if raw_text.is_empty() {
+            vec![Line::default()]
+        } else {
+            wrap_styled_spans(&[Span::styled(raw_text, style)], inner_max, WrapPrefix::empty())
+        };
+        let box_inner_w = wrapped
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .max(20.min(inner_max))
+            .min(inner_max);
+
+        let first_line_idx = self.lines.len();
+        let col_start = pfx_w.min(self.width) as u16;
+        let col_end = (pfx_w + box_inner_w + 4).min(self.width) as u16;
+
+        for line in wrapped {
+            let mut row_spans = pfx.clone();
+            let content_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let cw = UnicodeWidthStr::width(content_text.as_str());
+            let pad = box_inner_w.saturating_sub(cw);
+            let framed = format!("[ {content_text}{} ]", " ".repeat(pad));
+            row_spans.push(Span::styled(framed, style));
+            self.lines.push(Line::from(row_spans));
+        }
+
+        self.controls.push(InteractiveControl {
+            index: idx,
+            node_id: id,
+            kind: ControlKind::TextInput { value },
+            label: el.get_attr("name").unwrap_or("textarea").to_string(),
+            line: first_line_idx,
+            col_start,
+            col_end,
+        });
     }
 
     fn render_input(&mut self, id: DomNodeId, el: &ElementData) {
@@ -838,7 +1332,14 @@ impl<'a> RenderCtx<'a> {
                     value.clone()
                 };
                 let editing = self.editing_input == Some(id);
-                let shown = format_input_box(&display_val, el.get_attr("placeholder"), editing, 14);
+                let avail_inner = self.width.saturating_sub(self.prefix_width() + 4).max(4);
+                let shown = format_input_box(
+                    &display_val,
+                    el.get_attr("placeholder"),
+                    editing,
+                    14.min(avail_inner),
+                    avail_inner,
+                );
                 let input_style = Style::default()
                     .fg(self.theme.control_fg)
                     .bg(self.theme.control_bg);
@@ -868,72 +1369,206 @@ impl<'a> RenderCtx<'a> {
         self.prefix_stack.pop();
     }
 
+    /// Detects layout tables (`role="presentation"|"none"`, nested `<table>`, `max_cols <= 1`,
+    /// or `!has_th_or_thead && has_block_td`) ported from Outlook's HTML parser so layout tables
+    /// linearize cleanly instead of rendering as broken grids.
+    fn should_linearize_table(&self, table_id: DomNodeId) -> bool {
+        if self.has_presentation_role(table_id) || self.has_nested_table(table_id) {
+            return true;
+        }
+        let Some(table_node) = self.doc.node(table_id) else {
+            return false;
+        };
+
+        let mut max_cols = 0usize;
+        let mut has_th_or_thead = false;
+        let mut has_block_td = false;
+
+        for &child_id in &table_node.children {
+            let Some(child_el) = self.doc.element(child_id) else {
+                continue;
+            };
+            if self.doc.is_effectively_hidden(child_id) {
+                continue;
+            }
+            if self.has_presentation_role(child_id) {
+                return true;
+            }
+            match child_el.tag.as_str() {
+                "thead" | "tbody" | "tfoot" => {
+                    if child_el.tag == "thead" {
+                        has_th_or_thead = true;
+                    }
+                    if let Some(sec_node) = self.doc.node(child_id) {
+                        for &row_id in &sec_node.children {
+                            if self.doc.element(row_id).is_some_and(|e| e.tag == "tr") {
+                                if self.has_presentation_role(row_id) {
+                                    return true;
+                                }
+                                max_cols = max_cols.max(self.count_row_columns(row_id));
+                                self.inspect_row_cells(
+                                    row_id,
+                                    &mut has_th_or_thead,
+                                    &mut has_block_td,
+                                );
+                            }
+                        }
+                    }
+                }
+                "tr" => {
+                    max_cols = max_cols.max(self.count_row_columns(child_id));
+                    self.inspect_row_cells(child_id, &mut has_th_or_thead, &mut has_block_td);
+                }
+                _ => {}
+            }
+        }
+
+        max_cols <= 1 || (!has_th_or_thead && has_block_td)
+    }
+
+    fn has_presentation_role(&self, id: DomNodeId) -> bool {
+        self.doc.get_attr(id, "role").is_some_and(|r| {
+            let t = r.trim();
+            t.eq_ignore_ascii_case("presentation") || t.eq_ignore_ascii_case("none")
+        })
+    }
+
+    fn has_nested_table(&self, table_id: DomNodeId) -> bool {
+        let mut stack = self
+            .doc
+            .node(table_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        while let Some(nid) = stack.pop() {
+            if self.doc.element(nid).is_some_and(|e| e.tag == "table") {
+                return true;
+            }
+            if let Some(n) = self.doc.node(nid) {
+                stack.extend(&n.children);
+            }
+        }
+        false
+    }
+
+    fn count_row_columns(&self, row_id: DomNodeId) -> usize {
+        let Some(row_node) = self.doc.node(row_id) else {
+            return 0;
+        };
+        let mut cols = 0usize;
+        for &cid in &row_node.children {
+            if let Some(el) = self.doc.element(cid) {
+                if el.tag == "td" || el.tag == "th" {
+                    let span = el
+                        .get_attr("colspan")
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(1);
+                    cols += span;
+                }
+            }
+        }
+        cols
+    }
+
+    fn inspect_row_cells(
+        &self,
+        row_id: DomNodeId,
+        has_th: &mut bool,
+        has_block_td: &mut bool,
+    ) {
+        let Some(row_node) = self.doc.node(row_id) else {
+            return;
+        };
+        for &cid in &row_node.children {
+            let Some(el) = self.doc.element(cid) else {
+                continue;
+            };
+            match el.tag.as_str() {
+                "th" => *has_th = true,
+                "td" => {
+                    let mut stack = self
+                        .doc
+                        .node(cid)
+                        .map(|n| n.children.clone())
+                        .unwrap_or_default();
+                    while let Some(desc) = stack.pop() {
+                        if let Some(del) = self.doc.element(desc) {
+                            if matches!(
+                                del.tag.as_str(),
+                                "div"
+                                    | "p"
+                                    | "ul"
+                                    | "ol"
+                                    | "blockquote"
+                                    | "pre"
+                                    | "h1"
+                                    | "h2"
+                                    | "h3"
+                                    | "h4"
+                                    | "h5"
+                                    | "h6"
+                                    | "hr"
+                                    | "table"
+                            ) {
+                                *has_block_td = true;
+                                break;
+                            }
+                        }
+                        if let Some(dn) = self.doc.node(desc) {
+                            stack.extend(&dn.children);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn render_table(&mut self, table_id: DomNodeId, style: Style) {
         self.ensure_block_break(true);
-        let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
+        let mut rows: Vec<(bool, Vec<Vec<Span<'static>>>)> = Vec::new();
         self.collect_table_rows(table_id, &mut rows);
         if rows.is_empty() {
             return;
         }
 
-        let num_cols = rows.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
-        if num_cols == 0 {
-            return;
-        }
+        let (headers, body_rows): (Vec<Vec<Span<'static>>>, Vec<Vec<Vec<Span<'static>>>>) =
+            if rows.first().is_some_and(|(is_hdr, _)| *is_hdr) {
+                let mut iter = rows.into_iter();
+                let hdr = iter.next().map(|(_, r)| r).unwrap_or_default();
+                let body = iter.map(|(_, r)| r).collect();
+                (hdr, body)
+            } else {
+                (Vec::new(), rows.into_iter().map(|(_, r)| r).collect())
+            };
 
-        let mut col_widths = vec![1usize; num_cols];
-        for (_, row) in &rows {
-            for (i, cell) in row.iter().enumerate() {
-                col_widths[i] = col_widths[i].max(UnicodeWidthStr::width(cell.as_str()));
-            }
-        }
-
-        let avail = self.width.saturating_sub(self.prefix_width());
-        let sep_total = (num_cols.saturating_sub(1)) * 3;
-        let max_cells_w = avail.saturating_sub(sep_total).max(num_cols * 3);
-        let sum_w: usize = col_widths.iter().sum();
-        if sum_w > max_cells_w {
-            for w in &mut col_widths {
-                *w = ((*w * max_cells_w) / sum_w).max(3);
-            }
-        }
-
+        let prefix = self.prefix_spans();
         let border_style = Style::default().fg(self.theme.border);
         let header_style = Style::default()
             .fg(self.theme.heading)
             .add_modifier(Modifier::BOLD);
+        let alignments: Vec<TableAlign> = Vec::new();
 
-        for (row_idx, (is_header, row)) in rows.iter().enumerate() {
-            self.ensure_prefix();
-            let cell_style = if *is_header { header_style } else { style };
-            for (c_idx, &col_w) in col_widths.iter().enumerate() {
-                if c_idx > 0 {
-                    self.cur_spans
-                        .push(Span::styled(" │ ".to_string(), border_style));
-                }
-                let raw = row.get(c_idx).map(String::as_str).unwrap_or("");
-                let fitted = pad_or_truncate(raw, col_w);
-                self.cur_spans.push(Span::styled(fitted, cell_style));
-            }
-            self.flush_line(false);
-
-            if *is_header && row_idx == 0 {
-                self.ensure_prefix();
-                for (c_idx, &col_w) in col_widths.iter().enumerate() {
-                    if c_idx > 0 {
-                        self.cur_spans
-                            .push(Span::styled("─┼─".to_string(), border_style));
-                    }
-                    self.cur_spans
-                        .push(Span::styled("─".repeat(col_w), border_style));
-                }
-                self.flush_line(false);
-            }
-        }
+        let spec = TableSpec {
+            headers: &headers,
+            rows: &body_rows,
+            alignments: &alignments,
+            border: TableBorder::Pipe,
+            prefix: &prefix,
+            border_style,
+            header_style,
+            cell_style: style,
+        };
+        let table_lines = render_wrapped_table(&spec, self.width);
+        self.lines.extend(table_lines);
         self.ensure_block_break(true);
     }
 
-    fn collect_table_rows(&self, node_id: DomNodeId, rows: &mut Vec<(bool, Vec<String>)>) {
+    fn collect_table_rows(
+        &self,
+        node_id: DomNodeId,
+        rows: &mut Vec<(bool, Vec<Vec<Span<'static>>>)>,
+    ) {
         let Some(node) = self.doc.node(node_id) else {
             return;
         };
@@ -958,10 +1593,10 @@ impl<'a> RenderCtx<'a> {
                                 if cell_el.tag != "th" {
                                     all_th = false;
                                 }
-                                let txt = collapse_html_ws(&self.doc.text_content(cell_id))
+                                let txt = collapse_html_ws(&self.doc.visible_text_content(cell_id))
                                     .trim()
                                     .to_string();
-                                cells.push(txt);
+                                cells.push(vec![Span::raw(txt)]);
                             }
                         }
                     }
@@ -975,48 +1610,56 @@ impl<'a> RenderCtx<'a> {
     }
 }
 
-fn format_input_box(value: &str, placeholder: Option<&str>, editing: bool, min_w: usize) -> String {
-    let inner = if !value.is_empty() {
-        if editing {
-            format!("{value}▏")
-        } else {
-            value.to_string()
-        }
-    } else if editing {
-        "▏".to_string()
-    } else if let Some(ph) = placeholder.filter(|p| !p.trim().is_empty()) {
-        ph.trim().to_string()
-    } else {
-        String::new()
-    };
-    let w = UnicodeWidthStr::width(inner.as_str());
-    let pad = min_w.saturating_sub(w);
-    format!("[ {inner}{} ]", "_".repeat(pad))
+#[cfg(feature = "graphics")]
+fn compute_graphic_rows(width_px: u32, height_px: u32, avail_cols: usize) -> usize {
+    let w = width_px.max(1) as f32;
+    let h = height_px.max(1) as f32;
+    let target_cols = (avail_cols as f32).min((w / 8.0).max(8.0));
+    let rows = ((h / w) * target_cols * 0.5).round() as usize;
+    rows.clamp(3, 24)
 }
 
-fn pad_or_truncate(s: &str, target_w: usize) -> String {
-    let w = UnicodeWidthStr::width(s);
-    if w <= target_w {
-        format!("{s}{}", " ".repeat(target_w - w))
+fn format_input_box(
+    value: &str,
+    placeholder: Option<&str>,
+    editing: bool,
+    min_w: usize,
+    max_inner_w: usize,
+) -> String {
+    let max_w = max_inner_w.max(2);
+    let inner = if editing {
+        let win = windowed_single_line_input(value, value.len(), max_w);
+        format!(
+            "{}{}▏{}{}",
+            if win.clipped_left { "‹" } else { "" },
+            win.before_cursor,
+            win.after_cursor,
+            if win.clipped_right { "›" } else { "" }
+        )
     } else {
-        let mut out = String::new();
-        let mut cur = 0usize;
-        let limit = target_w.saturating_sub(1);
-        for ch in s.chars() {
-            let cw = ch.width().unwrap_or(1);
-            if cur + cw > limit {
-                break;
-            }
-            out.push(ch);
-            cur += cw;
+        let raw = if !value.is_empty() {
+            value
+        } else if let Some(ph) = placeholder.filter(|p| !p.trim().is_empty()) {
+            ph.trim()
+        } else {
+            ""
+        };
+        if UnicodeWidthStr::width(raw) <= max_w {
+            raw.to_string()
+        } else {
+            // Window from start (cursor at 0) without cursor glyph so non-editing display never overflows.
+            let win = windowed_single_line_input(raw, 0, max_w.saturating_add(1));
+            format!(
+                "{}{}",
+                win.after_cursor,
+                if win.clipped_right { "›" } else { "" }
+            )
         }
-        out.push('…');
-        let used = cur + 1;
-        if used < target_w {
-            out.push_str(&" ".repeat(target_w - used));
-        }
-        out
-    }
+    };
+    let w = UnicodeWidthStr::width(inner.as_str());
+    let target = min_w.min(max_w);
+    let pad = target.saturating_sub(w);
+    format!("[ {inner}{} ]", "_".repeat(pad))
 }
 
 fn collapse_html_ws(s: &str) -> String {
@@ -1036,7 +1679,7 @@ fn collapse_html_ws(s: &str) -> String {
     out
 }
 
-fn parse_css_color(raw: &str) -> Option<Color> {
+pub(crate) fn parse_css_color(raw: &str) -> Option<Color> {
     let s = raw.trim().to_ascii_lowercase();
     if let Some(hex) = s.strip_prefix('#') {
         if hex.len() == 6 {
@@ -1131,5 +1774,108 @@ mod tests {
         // "Press " is 6 cols, "[ Launch ]" is 10 cols -> cols 6..16
         assert_eq!(ctrl.col_start, 6);
         assert_eq!(ctrl.col_end, 16);
+    }
+
+    #[test]
+    fn long_controls_textarea_pre_and_raw_html_wrap_losslessly() {
+        let long_100 = "A".repeat(100);
+        let html = format!(
+            r#"<p><a href="https://example.com">{long_100}</a></p>
+               <p><button>{long_100}</button></p>
+               <details><summary>{long_100}</summary><p>Inner</p></details>
+               <textarea>line1
+line2
+line3</textarea>
+               <pre>	tab_indented_very_long_code_identifier_that_must_wrap_cleanly_without_losing_any_chars</pre>"#
+        );
+        let doc = DomDocument::parse(&html);
+        let r = render_dom(&doc, 40, &HtmlTheme::dark(), None, None, false);
+        for (i, line) in r.lines.iter().enumerate() {
+            assert!(
+                line.width() <= 40,
+                "line {i} overflowed width 40: {} ({:?})",
+                line.width(),
+                line
+            );
+        }
+        for ctrl in &r.controls {
+            assert!(
+                ctrl.col_end <= 40,
+                "control {:?} col_end={} > 40",
+                ctrl.kind,
+                ctrl.col_end
+            );
+        }
+        let txt = rendered_text(&r);
+        assert!(txt.contains("line1"));
+        assert!(txt.contains("line2"));
+        assert!(txt.contains("line3"));
+        let l1 = r.lines.iter().position(|l| l.to_string().contains("line1")).unwrap();
+        let l2 = r.lines.iter().position(|l| l.to_string().contains("line2")).unwrap();
+        let l3 = r.lines.iter().position(|l| l.to_string().contains("line3")).unwrap();
+        assert!(l1 < l2 && l2 < l3);
+        let pre_no_ws: String = txt
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect();
+        assert!(pre_no_ws.contains("tab_indented_very_long_code_identifier_that_must_wrap_cleanly_without_losing_any_chars"));
+
+        let raw_lines = render_raw_html(&html, 40, &HtmlTheme::dark());
+        for (i, line) in raw_lines.iter().enumerate() {
+            assert!(
+                line.width() <= 40,
+                "raw html line {i} overflowed width 40: {}",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn zero_source_leak_with_media_script_xml_svg_desc_and_layout_vs_data_table() {
+        let html = r#"
+            <style>
+              @media (max-width: 600px) { .m { color: red; } }
+              .hidden { display: none; }
+            </style>
+            <div class="hidden">ShouldNotAppear</div>
+            <table role="presentation">
+              <tr><td><p>Layout cell</p><xml><o:p>meta</o:p></xml></td></tr>
+            </table>
+            <p><a href="https://example.com">VisibleLink<style>.a{color:blue}</style><script>const x=1;</script></a></p>
+            <button>VisibleBtn<svg><desc>secret-svg-desc</desc><rect width="20" height="20"/></svg></button>
+            <details><summary>VisibleSum<xml>meta-sum</xml></summary><p>Body</p></details>
+            <pre>safe_code<script>evil_js()</script></pre>
+            <table>
+              <thead><tr><th>ColA</th><th>ColB</th></tr></thead>
+              <tbody><tr><td>ValA</td><td>ValB</td></tr></tbody>
+            </table>
+        "#;
+        let mut doc = DomDocument::parse(html);
+        let r = render_dom(&doc, 80, &HtmlTheme::dark(), None, None, false);
+        let text = rendered_text(&r);
+
+        assert!(text.contains("Layout cell"));
+        assert!(text.contains("VisibleLink"));
+        assert!(text.contains("VisibleBtn"));
+        assert!(text.contains("VisibleSum"));
+        assert!(text.contains("safe_code"));
+        assert!(text.contains("ColA"));
+        assert!(text.contains("│"));
+        assert!(text.contains("─┼─"));
+
+        // Zero source code / metadata / hidden leak assertions
+        assert!(!text.contains("ShouldNotAppear"));
+        assert!(!text.contains("color: red"));
+        assert!(!text.contains("const x=1"));
+        assert!(!text.contains("evil_js"));
+        assert!(!text.contains("meta"));
+        assert!(!text.contains("secret-svg-desc"));
+
+        // `set_inner_html` with comment-only fragment must not leak `<!--`
+        let body = doc.query_selector("body").unwrap();
+        doc.set_inner_html(body, "<!-- comment only -->");
+        assert!(!doc.visible_text_content(body).contains("<!--"));
+        let r2 = render_dom(&doc, 80, &HtmlTheme::dark(), None, None, false);
+        assert!(!rendered_text(&r2).contains("<!--"));
     }
 }
