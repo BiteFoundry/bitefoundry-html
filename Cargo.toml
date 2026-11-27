@@ -18,8 +18,8 @@ axum = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rand = { version = "0.8", optional = true }
-ratatui = "0.28"
-resvg = { version = "0.50", optional = true }
+ratatui = "0.29"
+resvg = { version = "0.50", default-features = false, features = ["text", "system-fonts", "svgz"], optional = true }
 rquickjs = { version = "0.14", features = ["classes", "array-buffer"], optional = true }
 scraper = "0.20"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"], optional = true }
